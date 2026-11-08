@@ -1,0 +1,6 @@
+{
+  "name": "Astryn AI",
+  "description": "Astryn AI is a futuristic glassmorphic AI chat assistant with multi-turn Gemini streaming, context budgeting, and searchable local conversation history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Deep Obsidian-Navy Cosmic Base -->
+    <path android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="18"
+                android:startY="10"
+                android:endX="90"
+                android:endY="98"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF050814" />
+                <item android:offset="0.52" android:color="#FF0B1128" />
+                <item android:offset="1.0" android:color="#FF070A1A" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Subtle Ambient Celestial Glow -->
+    <path android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="54"
+                android:centerY="50"
+                android:gradientRadius="46"
+                android:type="radial">
+                <item android:offset="0.0" android:color="#383B82F6" />
+                <item android:offset="0.55" android:color="#228B5CF6" />
+                <item android:offset="1.0" android:color="#00050814" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>
