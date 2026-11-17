@@ -130,13 +130,24 @@ class UserApiKeyManager(
 ) {
   private val inMemoryStore = LinkedHashMap<String, String>()
   private var isHardwareKeystoreActive: Boolean = true
+  @Volatile private var activeUserScope: String = DEFAULT_USER_SCOPE
 
   private val _configStateFlow = MutableStateFlow(loadInitialState())
   val configStateFlow: StateFlow<ApiKeyConfigState> = _configStateFlow.asStateFlow()
 
+  data class EncryptedKeyAuditMetadata(
+    val userScope: String,
+    val hasCiphertext: Boolean,
+    val ivLengthBytes: Int,
+    val ivBase64: String?,
+    val ciphertextBase64: String?,
+    val isPlaintextAbsentFromStorage: Boolean
+  )
+
   companion object {
     const val PROVIDER_GOOGLE_GEMINI = "Google Gemini"
     const val OFFICIAL_AI_STUDIO_KEY_URL = "https://aistudio.google.com/app/apikey"
+    private const val DEFAULT_USER_SCOPE = "default"
 
     private const val PREFS_FILE_NAME = "astryn_secure_api_key_store"
     private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
@@ -254,6 +265,68 @@ class UserApiKeyManager(
   }
 
   /**
+   * Binds the API key vault to a specific authenticated user UID so User A's personal API key
+   * is isolated from User B when switching accounts on a shared device.
+   */
+  @Synchronized
+  fun bindToUser(userUid: String?) {
+    val sanitizedScope =
+      userUid
+        ?.trim()
+        ?.replace(Regex("[^a-zA-Z0-9_\\-]"), "_")
+        ?.takeIf { it.isNotEmpty() }
+        ?: DEFAULT_USER_SCOPE
+    if (activeUserScope != sanitizedScope) {
+      activeUserScope = sanitizedScope
+      _configStateFlow.value = loadInitialState()
+    }
+  }
+
+  fun getActiveUserScope(): String = activeUserScope
+
+  private fun scopedKey(baseKey: String): String {
+    return if (activeUserScope == DEFAULT_USER_SCOPE) {
+      baseKey
+    } else {
+      "${baseKey}__u_${activeUserScope}"
+    }
+  }
+
+  /**
+   * Returns audit metadata for verifying AES-256-GCM encryption, unique 12-byte IV generation,
+   * and absence of plaintext keys in storage.
+   */
+  @Synchronized
+  fun getEncryptedPayloadMetadataForAudit(expectedPlaintextNotPresent: String? = null): EncryptedKeyAuditMetadata {
+    val cipherB64 = readString(scopedKey(KEY_CIPHERTEXT_B64))
+    val ivB64 = readString(scopedKey(KEY_IV_B64))
+    val ivBytesLen =
+      if (!ivB64.isNullOrBlank()) {
+        try {
+          java.util.Base64.getDecoder().decode(ivB64).size
+        } catch (_: Exception) {
+          0
+        }
+      } else {
+        0
+      }
+    val plaintextAbsent =
+      if (expectedPlaintextNotPresent.isNullOrBlank()) {
+        true
+      } else {
+        inMemoryStore.values.none { it.contains(expectedPlaintextNotPresent) }
+      }
+    return EncryptedKeyAuditMetadata(
+      userScope = activeUserScope,
+      hasCiphertext = !cipherB64.isNullOrBlank(),
+      ivLengthBytes = ivBytesLen,
+      ivBase64 = ivB64,
+      ciphertextBase64 = cipherB64,
+      isPlaintextAbsentFromStorage = plaintextAbsent
+    )
+  }
+
+  /**
    * Returns true if the user has saved an encrypted Gemini API key.
    */
   fun hasSavedKey(): Boolean {
@@ -279,11 +352,11 @@ class UserApiKeyManager(
       val detail =
         "API key saved and encrypted locally ($masked). Tap 'Test Connection' to verify live Gemini access."
 
-      writeString(KEY_CIPHERTEXT_B64, ciphertextB64)
-      writeString(KEY_IV_B64, ivB64)
-      writeString(KEY_MASKED_PREVIEW, masked)
-      writeString(KEY_CONNECTION_STATUS, status.name)
-      writeString(KEY_STATUS_DETAIL, detail)
+      writeString(scopedKey(KEY_CIPHERTEXT_B64), ciphertextB64)
+      writeString(scopedKey(KEY_IV_B64), ivB64)
+      writeString(scopedKey(KEY_MASKED_PREVIEW), masked)
+      writeString(scopedKey(KEY_CONNECTION_STATUS), status.name)
+      writeString(scopedKey(KEY_STATUS_DETAIL), detail)
 
       val updatedState =
         ApiKeyConfigState(
@@ -292,7 +365,7 @@ class UserApiKeyManager(
           maskedKeyPreview = masked,
           connectionStatus = status,
           statusDetailMessage = detail,
-          lastTestedModelId = readString(KEY_LAST_TESTED_MODEL),
+          lastTestedModelId = readString(scopedKey(KEY_LAST_TESTED_MODEL)),
           lastUpdatedTimestamp = System.currentTimeMillis(),
           isKeystoreBacked = isHardwareKeystoreActive,
         )
@@ -311,8 +384,8 @@ class UserApiKeyManager(
    */
   @Synchronized
   fun getDecryptedApiKey(): String? {
-    val ciphertextB64 = readString(KEY_CIPHERTEXT_B64) ?: return null
-    val ivB64 = readString(KEY_IV_B64) ?: return null
+    val ciphertextB64 = readString(scopedKey(KEY_CIPHERTEXT_B64)) ?: return null
+    val ivB64 = readString(scopedKey(KEY_IV_B64)) ?: return null
     if (ciphertextB64.isBlank() || ivB64.isBlank()) return null
 
     return try {
@@ -328,12 +401,12 @@ class UserApiKeyManager(
    */
   @Synchronized
   fun clearApiKey() {
-    removeKey(KEY_CIPHERTEXT_B64)
-    removeKey(KEY_IV_B64)
-    removeKey(KEY_MASKED_PREVIEW)
-    removeKey(KEY_CONNECTION_STATUS)
-    removeKey(KEY_STATUS_DETAIL)
-    removeKey(KEY_LAST_TESTED_MODEL)
+    removeKey(scopedKey(KEY_CIPHERTEXT_B64))
+    removeKey(scopedKey(KEY_IV_B64))
+    removeKey(scopedKey(KEY_MASKED_PREVIEW))
+    removeKey(scopedKey(KEY_CONNECTION_STATUS))
+    removeKey(scopedKey(KEY_STATUS_DETAIL))
+    removeKey(scopedKey(KEY_LAST_TESTED_MODEL))
 
     _configStateFlow.value =
       ApiKeyConfigState(
@@ -373,9 +446,9 @@ class UserApiKeyManager(
     if (!current.hasSavedKey) return
     val status = ApiConnectionStatus.CONNECTED
     val detail = "Connected • Verified live response from $modelId."
-    writeString(KEY_CONNECTION_STATUS, status.name)
-    writeString(KEY_STATUS_DETAIL, detail)
-    writeString(KEY_LAST_TESTED_MODEL, modelId)
+    writeString(scopedKey(KEY_CONNECTION_STATUS), status.name)
+    writeString(scopedKey(KEY_STATUS_DETAIL), detail)
+    writeString(scopedKey(KEY_LAST_TESTED_MODEL), modelId)
 
     _configStateFlow.value =
       current.copy(
@@ -396,9 +469,9 @@ class UserApiKeyManager(
     val (newStatus, detailMessage) = classifyConnectionFailure(throwable, modelId)
 
     if (current.hasSavedKey) {
-      writeString(KEY_CONNECTION_STATUS, newStatus.name)
-      writeString(KEY_STATUS_DETAIL, detailMessage)
-      writeString(KEY_LAST_TESTED_MODEL, modelId)
+      writeString(scopedKey(KEY_CONNECTION_STATUS), newStatus.name)
+      writeString(scopedKey(KEY_STATUS_DETAIL), detailMessage)
+      writeString(scopedKey(KEY_LAST_TESTED_MODEL), modelId)
     }
 
     _configStateFlow.value =
@@ -463,8 +536,8 @@ class UserApiKeyManager(
   }
 
   private fun loadInitialState(): ApiKeyConfigState {
-    val ciphertext = readString(KEY_CIPHERTEXT_B64)
-    val iv = readString(KEY_IV_B64)
+    val ciphertext = readString(scopedKey(KEY_CIPHERTEXT_B64))
+    val iv = readString(scopedKey(KEY_IV_B64))
     val hasEncryptedKey = !ciphertext.isNullOrBlank() && !iv.isNullOrBlank()
     if (!hasEncryptedKey) {
       return ApiKeyConfigState(
@@ -491,9 +564,9 @@ class UserApiKeyManager(
       )
     }
 
-    val masked = readString(KEY_MASKED_PREVIEW)?.ifBlank { null } ?: maskApiKey(decrypted)
+    val masked = readString(scopedKey(KEY_MASKED_PREVIEW))?.ifBlank { null } ?: maskApiKey(decrypted)
     val savedStatus =
-      ApiConnectionStatus.fromNameSafe(readString(KEY_CONNECTION_STATUS)).let { status ->
+      ApiConnectionStatus.fromNameSafe(readString(scopedKey(KEY_CONNECTION_STATUS))).let { status ->
         if (status == ApiConnectionStatus.NOT_CONFIGURED || status == ApiConnectionStatus.TESTING) {
           ApiConnectionStatus.SAVED_UNTESTED
         } else {
@@ -501,7 +574,7 @@ class UserApiKeyManager(
         }
       }
     val detail =
-      readString(KEY_STATUS_DETAIL)?.ifBlank { null }
+      readString(scopedKey(KEY_STATUS_DETAIL))?.ifBlank { null }
         ?: "API key saved and encrypted locally ($masked)."
 
     return ApiKeyConfigState(
@@ -510,7 +583,7 @@ class UserApiKeyManager(
       maskedKeyPreview = masked,
       connectionStatus = savedStatus,
       statusDetailMessage = detail,
-      lastTestedModelId = readString(KEY_LAST_TESTED_MODEL),
+      lastTestedModelId = readString(scopedKey(KEY_LAST_TESTED_MODEL)),
       lastUpdatedTimestamp = System.currentTimeMillis(),
       isKeystoreBacked = isHardwareKeystoreActive,
     )
@@ -519,18 +592,24 @@ class UserApiKeyManager(
   private fun encryptPlaintext(plaintext: String): Pair<String, String> {
     val secretKey = getOrCreateAesSecretKey()
     val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
-    cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+    if (isHardwareKeystoreActive) {
+      cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+    } else {
+      val ivBytes = ByteArray(12)
+      SecureRandom().nextBytes(ivBytes)
+      cipher.init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_BITS, ivBytes))
+    }
     val ivBytes = cipher.iv
     val ciphertextBytes = cipher.doFinal(plaintext.toByteArray(StandardCharsets.UTF_8))
-    val cipherB64 = Base64.encodeToString(ciphertextBytes, Base64.NO_WRAP)
-    val ivB64 = Base64.encodeToString(ivBytes, Base64.NO_WRAP)
+    val cipherB64 = java.util.Base64.getEncoder().encodeToString(ciphertextBytes)
+    val ivB64 = java.util.Base64.getEncoder().encodeToString(ivBytes)
     return cipherB64 to ivB64
   }
 
   private fun decryptCiphertext(ciphertextB64: String, ivB64: String): String {
     val secretKey = getOrCreateAesSecretKey()
-    val cipherBytes = Base64.decode(ciphertextB64, Base64.NO_WRAP)
-    val ivBytes = Base64.decode(ivB64, Base64.NO_WRAP)
+    val cipherBytes = java.util.Base64.getDecoder().decode(ciphertextB64)
+    val ivBytes = java.util.Base64.getDecoder().decode(ivB64)
     val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
     val spec = GCMParameterSpec(GCM_TAG_BITS, ivBytes)
     cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)
@@ -567,14 +646,14 @@ class UserApiKeyManager(
       isHardwareKeystoreActive = false
       val existingSecretB64 = readString(KEY_FALLBACK_AES_SECRET_B64)
       if (!existingSecretB64.isNullOrBlank()) {
-        val decoded = Base64.decode(existingSecretB64, Base64.NO_WRAP)
+        val decoded = java.util.Base64.getDecoder().decode(existingSecretB64)
         if (decoded.size == 32) {
           return SecretKeySpec(decoded, "AES")
         }
       }
       val randomBytes = ByteArray(32)
       SecureRandom().nextBytes(randomBytes)
-      val encoded = Base64.encodeToString(randomBytes, Base64.NO_WRAP)
+      val encoded = java.util.Base64.getEncoder().encodeToString(randomBytes)
       writeString(KEY_FALLBACK_AES_SECRET_B64, encoded)
       return SecretKeySpec(randomBytes, "AES")
     }

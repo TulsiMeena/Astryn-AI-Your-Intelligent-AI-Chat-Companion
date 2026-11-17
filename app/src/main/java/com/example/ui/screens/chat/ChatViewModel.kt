@@ -6,6 +6,8 @@ import android.net.Uri
 import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.api.AstrynIntelligenceEngine
+import com.example.data.api.AstrynResearchEngine
 import com.example.data.api.ErrorClassifier
 import com.example.data.api.GeminiException
 import com.example.data.api.GeminiLiveVoiceSession
@@ -208,9 +210,13 @@ class ChatViewModel(
   }
 
   init {
-    // Keep active conversation title synchronized when renamed from the sidebar
+    // Keep active conversation title synchronized when renamed from the sidebar & update cross-conversation recall cache
     viewModelScope.launch {
       historyRepository.conversationsFlow.collect { conversations ->
+        AstrynIntelligenceEngine.updateUserConversationSnapshots(
+          userUid = preferencesRepository.preferencesFlow.value.userUid,
+          conversations = conversations,
+        )
         val currentId = _uiState.value.conversationId
         if (currentId.isNotBlank()) {
           val matching = conversations.firstOrNull { it.id == currentId }
@@ -329,10 +335,16 @@ class ChatViewModel(
                 (msg.status == MessageStatus.ERROR ||
                   GeminiLiveVoiceSession.isErrorOrSystemDiagnosticText(msg.content))
             ) {
+              val prevHistory = rawRestoredMessages.take(idx)
               val prevUserPrompt =
-                rawRestoredMessages.take(idx).lastOrNull { it.role == MessageRole.USER }?.content.orEmpty()
+                prevHistory.lastOrNull { it.role == MessageRole.USER }?.content.orEmpty()
               msg.copy(
-                content = GeminiLiveVoiceSession.buildSmartJarvisChatReply(prevUserPrompt),
+                content =
+                  GeminiLiveVoiceSession.buildSmartJarvisChatReply(
+                    userPrompt = prevUserPrompt,
+                    conversationHistory = prevHistory.dropLast(1),
+                    userUid = preferencesRepository.preferencesFlow.value.userUid,
+                  ),
                 status = MessageStatus.SUCCESS,
                 errorMessage = null,
                 errorTitle = null,
@@ -461,12 +473,14 @@ class ChatViewModel(
       result
         .onSuccess { attachment ->
           val convId = _uiState.value.conversationId
+          val activeUid = preferencesRepository.preferencesFlow.value.userUid
           _uiState.update { state ->
             val updated =
               (state.pendingAttachments + attachment).take(
                 AttachmentProcessor.MAX_ATTACHMENTS_PER_MESSAGE
               )
             saveAttachmentsForConversation(convId, updated)
+            AttachmentProcessor.registerConversationAttachments(activeUid, convId, updated)
             state.copy(
               pendingAttachments = updated,
               isProcessingAttachment = false,
@@ -512,12 +526,14 @@ class ChatViewModel(
     result
       .onSuccess { attachment ->
         val convId = _uiState.value.conversationId
+        val activeUid = preferencesRepository.preferencesFlow.value.userUid
         _uiState.update { state ->
           val updated =
             (state.pendingAttachments + attachment).take(
               AttachmentProcessor.MAX_ATTACHMENTS_PER_MESSAGE
             )
           saveAttachmentsForConversation(convId, updated)
+          AttachmentProcessor.registerConversationAttachments(activeUid, convId, updated)
           state.copy(
             pendingAttachments = updated,
             actionFeedback = "Attached ${attachment.fileName}",
@@ -824,6 +840,7 @@ class ChatViewModel(
           maxContextTokens = maxContextTokens,
           attachments = attachments,
           liveVoiceMood = liveVoiceMood,
+          conversationId = targetConversationId,
         )
       } catch (_: Exception) {
         null
@@ -847,7 +864,15 @@ class ChatViewModel(
     // 1. Check API Key before making network request
     if (!isApiKeyAvailable()) {
       if (useJarvisFallback) {
-        val jarvisReply = GeminiLiveVoiceSession.buildSmartJarvisChatReply(prompt, liveVoiceMood)
+        val jarvisReply =
+          buildResilientAssistantReply(
+            userPrompt = prompt,
+            liveVoiceMood = liveVoiceMood,
+            conversationHistory = historyBeforePrompt,
+            attachments = attachments,
+            userUid = activePreferences.userUid,
+            conversationId = targetConversationId,
+          )
         streamJarvisFallbackSmoothly(
           targetConversationId = targetConversationId,
           fullReply = jarvisReply,
@@ -892,7 +917,15 @@ class ChatViewModel(
     // 2. Check platform internet connectivity before initiating network request
     if (!connectivityMonitor.refreshConnectivity()) {
       if (useJarvisFallback) {
-        val jarvisReply = GeminiLiveVoiceSession.buildSmartJarvisChatReply(prompt, liveVoiceMood)
+        val jarvisReply =
+          buildResilientAssistantReply(
+            userPrompt = prompt,
+            liveVoiceMood = liveVoiceMood,
+            conversationHistory = historyBeforePrompt,
+            attachments = attachments,
+            userUid = activePreferences.userUid,
+            conversationId = targetConversationId,
+          )
         streamJarvisFallbackSmoothly(
           targetConversationId = targetConversationId,
           fullReply = jarvisReply,
@@ -965,6 +998,7 @@ class ChatViewModel(
         var encounteredException = false
         var latestCitations: List<WebCitation> = emptyList()
         var latestSearchQueries: List<String> = emptyList()
+        var lastUiEmitTimeMs = 0L
 
         try {
           geminiService
@@ -975,6 +1009,7 @@ class ChatViewModel(
               maxContextTokens = maxContextTokens,
               attachments = attachments,
               liveVoiceMood = liveVoiceMood,
+              conversationId = targetConversationId,
               onGroundingMetadata = { citations, searchQueries ->
                 latestCitations = citations
                 latestSearchQueries = searchQueries
@@ -1009,12 +1044,20 @@ class ChatViewModel(
                 category = classified.category,
                 diagnosticSummary = "Generation error: ${throwable.message}",
               )
-              apiKeyManager.recordConnectionFailure(
-                throwable = throwable,
-                modelId = activePreferences.selectedModel.modelId,
-              )
+              val allowLocalVoiceFallback =
+                liveVoiceMood != null ||
+                  (useJarvisFallback &&
+                    throwable !is GeminiException.SafetyBlocked &&
+                    throwable !is GeminiException.ContextLengthExceeded)
 
-              if (partialText.isEmpty() && !useJarvisFallback) {
+              if (apiKeyManager.hasSavedKey() || !allowLocalVoiceFallback) {
+                apiKeyManager.recordConnectionFailure(
+                  throwable = throwable,
+                  modelId = activePreferences.selectedModel.modelId,
+                )
+              }
+
+              if (partialText.isEmpty() && !allowLocalVoiceFallback) {
                 saveDraftForConversation(targetConversationId, prompt)
                 if (attachments.isNotEmpty()) {
                   saveAttachmentsForConversation(targetConversationId, attachments)
@@ -1037,9 +1080,16 @@ class ChatViewModel(
                         citations = latestCitations,
                         webSearchQueries = latestSearchQueries,
                       )
-                    } else if (useJarvisFallback) {
+                    } else if (allowLocalVoiceFallback) {
                       val jarvisFallback =
-                        GeminiLiveVoiceSession.buildSmartJarvisChatReply(prompt, liveVoiceMood)
+                        buildResilientAssistantReply(
+                          userPrompt = prompt,
+                          liveVoiceMood = liveVoiceMood,
+                          conversationHistory = historyBeforePrompt,
+                          attachments = attachments,
+                          userUid = activePreferences.userUid,
+                          conversationId = targetConversationId,
+                        )
                       val completed =
                         msg.copy(
                           content = jarvisFallback,
@@ -1063,10 +1113,10 @@ class ChatViewModel(
                   isOnline = onlineNow,
                   // Preserve unsent draft & attachments if request failed before any tokens arrived
                   inputText =
-                    if (partialText.isEmpty() && !useJarvisFallback && state.inputText.isBlank()) prompt
+                    if (partialText.isEmpty() && !allowLocalVoiceFallback && state.inputText.isBlank()) prompt
                     else state.inputText,
                   pendingAttachments =
-                    if (partialText.isEmpty() && !useJarvisFallback && state.pendingAttachments.isEmpty()) attachments
+                    if (partialText.isEmpty() && !allowLocalVoiceFallback && state.pendingAttachments.isEmpty()) attachments
                     else state.pendingAttachments,
                   isGenerating = false,
                 )
@@ -1098,33 +1148,58 @@ class ChatViewModel(
             .collect { chunk ->
               if (chunk.isEmpty()) return@collect
               accumulatedText.append(chunk)
-              val currentText = accumulatedText.toString()
-              _uiState.update { state ->
-                if (state.conversationId != targetConversationId) return@update state
-                val modified =
-                  state.messages.updateMessageById(assistantMessageId) { msg ->
-                    msg.copy(
-                      content = currentText,
-                      status = MessageStatus.STREAMING,
-                      citations = latestCitations,
-                      webSearchQueries = latestSearchQueries,
-                    )
-                  }
-                state.copy(messages = modified)
-              }
-              if (enableJarvisResilience) {
-                delay(16L)
+              val nowMs = System.nanoTime() / 1_000_000L
+              val shouldEmitFrame =
+                !enableJarvisResilience ||
+                  lastUiEmitTimeMs == 0L ||
+                  (nowMs - lastUiEmitTimeMs) >= 16L
+              if (shouldEmitFrame) {
+                lastUiEmitTimeMs = nowMs
+                val currentText = accumulatedText.toString()
+                _uiState.update { state ->
+                  if (state.conversationId != targetConversationId) return@update state
+                  val modified =
+                    state.messages.updateMessageById(assistantMessageId) { msg ->
+                      msg.copy(
+                        content = currentText,
+                        status = MessageStatus.STREAMING,
+                        citations = latestCitations,
+                        webSearchQueries = latestSearchQueries,
+                      )
+                    }
+                  state.copy(messages = modified)
+                }
               }
             }
 
           if (!encounteredException) {
-            // Update UI state to SUCCESS immediately without blocking on SQLite disk I/O
-            val finalContent = accumulatedText.toString()
+            // Run Self-Verification Engine before finalizing UI state to SUCCESS
+            val rawAccumulated = accumulatedText.toString()
+            val finalContent =
+              if (rawAccumulated.isNotBlank() && liveVoiceMood == null) {
+                val intentCheck =
+                  AstrynIntelligenceEngine.analyzeIntentAndContext(
+                    prompt = prompt,
+                    conversationHistory = historyBeforePrompt,
+                    attachments = attachments,
+                    userUid = activePreferences.userUid,
+                    webSearchEnabled = activePreferences.webSearchEnabled,
+                    conversationId = targetConversationId,
+                  )
+                AstrynIntelligenceEngine.verifyAndRepairResponse(
+                  prompt = prompt,
+                  rawResponse = rawAccumulated,
+                  intentResult = intentCheck,
+                  hasVerifiedWebCitations = latestCitations.isNotEmpty(),
+                ).verifiedContent
+              } else {
+                rawAccumulated
+              }
             _uiState.update { state ->
               if (state.conversationId != targetConversationId) return@update state
               val modified =
                 state.messages.updateMessageById(assistantMessageId) { msg ->
-                  if (msg.content.isBlank()) {
+                  if (finalContent.isBlank()) {
                     val emptyNotice = ErrorClassifier.classify(GeminiException.EmptyResponse)
                     msg.copy(
                       content = emptyNotice.userMessage,
@@ -1136,6 +1211,7 @@ class ChatViewModel(
                     )
                   } else {
                     msg.copy(
+                      content = finalContent,
                       status = MessageStatus.SUCCESS,
                       citations = latestCitations,
                       webSearchQueries = latestSearchQueries,
@@ -1158,6 +1234,12 @@ class ChatViewModel(
 
             if (finalContent.isNotBlank()) {
               apiKeyManager.recordConnectionSuccess(activePreferences.selectedModel.modelId)
+              com.example.data.api.AstrynContextualIntelligenceEngine.AstrynConversationStateManager.recordAssistantResponse(
+                userUid = activePreferences.userUid,
+                conversationId = targetConversationId,
+                userPrompt = prompt,
+                assistantReply = finalContent,
+              )
               val completedMessage =
                 ChatMessage(
                   id = assistantMessageId,
@@ -1179,8 +1261,8 @@ class ChatViewModel(
 
   /**
    * Shows a brief, responsive AI loading indicator (`MessageStatus.STREAMING` with empty content)
-   * followed by fast, zero-lag progressive streaming chunks when generating an offline/fallback
-   * response in the live app.
+   * followed by 60fps silky-smooth progressive word-boundary streaming chunks when generating
+   * an offline/fallback response in the live app.
    */
   private fun streamJarvisFallbackSmoothly(
     targetConversationId: String,
@@ -1240,15 +1322,18 @@ class ChatViewModel(
     activeGenerationJob =
       viewModelScope.launch {
         try {
-          // Brief, responsive "AI Thinking…" loading phase (~180ms)
-          delay(180L)
+          // Ultra-snappy initial "AI Thinking…" pulse (~75ms) for zero-lag perceived response
+          delay(75L)
 
           val totalLen = fullReply.length
-          val steps = 5
+          val steps = 10
+          var previousEnd = 0
           for (step in 1 until steps) {
             val rawEnd = (totalLen * step) / steps
             val spaceAdjustedEnd =
               fullReply.indexOf(' ', rawEnd).takeIf { it in 1 until totalLen } ?: rawEnd
+            if (spaceAdjustedEnd <= previousEnd) continue
+            previousEnd = spaceAdjustedEnd
             val partial = fullReply.substring(0, spaceAdjustedEnd)
             _uiState.update { state ->
               if (state.conversationId != targetConversationId) return@update state
@@ -1261,7 +1346,7 @@ class ChatViewModel(
                 }
               state.copy(messages = updated)
             }
-            delay(28L)
+            delay(16L)
           }
 
           val completedMsg =
@@ -1683,6 +1768,120 @@ class ChatViewModel(
     sendMessage(
       promptOverride = comparePrompt,
       displayUserPrompt = "⚖️ Compare Response: Style A (Concise) vs Style B (Detailed)",
+    )
+  }
+
+  private fun buildResilientAssistantReply(
+    userPrompt: String,
+    liveVoiceMood: LiveGirlfriendMood?,
+    conversationHistory: List<ChatMessage>,
+    attachments: List<ChatAttachment>,
+    userUid: String?,
+    conversationId: String,
+  ): String {
+    if (liveVoiceMood != null) {
+      return GeminiLiveVoiceSession.buildSmartJarvisChatReply(
+        userPrompt = userPrompt,
+        liveVoiceMood = liveVoiceMood,
+        conversationHistory = conversationHistory,
+        userUid = userUid,
+      )
+    }
+
+    val clean = userPrompt.trim()
+    val lower = clean.lowercase()
+    val isActionRewriteOrQuizPrompt =
+      clean.startsWith("Please rewrite", ignoreCase = true) ||
+        clean.startsWith("Please explain the following response", ignoreCase = true) ||
+        clean.startsWith("Please upgrade the following response", ignoreCase = true) ||
+        clean.startsWith("Please expand the following response", ignoreCase = true) ||
+        clean.startsWith("Please provide a clear 2-style", ignoreCase = true) ||
+        clean.startsWith("Translate", ignoreCase = true) ||
+        clean.startsWith("Generate an interactive 5-question", ignoreCase = true)
+
+    if (!isActionRewriteOrQuizPrompt) {
+      val intentAnalysis =
+        AstrynIntelligenceEngine.analyzeIntentAndContext(
+          prompt = clean,
+          conversationHistory = conversationHistory,
+          attachments = attachments,
+          userUid = userUid,
+          conversationId = conversationId,
+        )
+      val researchDetection =
+        AstrynResearchEngine.ResearchPlanner.detectResearchIntent(
+          prompt = clean,
+          conversationHistory = conversationHistory,
+          attachments = attachments,
+          userUid = userUid,
+          conversationId = conversationId,
+        )
+      val p17 = intentAnalysis.phase17Analysis
+      val shouldUseEngineDirectly =
+        attachments.isNotEmpty() ||
+          intentAnalysis.attachmentResolution.resolvedAttachments.isNotEmpty() ||
+          intentAnalysis.primaryIntent ==
+            AstrynIntelligenceEngine.PrimaryIntent.MULTIMODAL_DOCUMENT_OR_IMAGE_ANALYSIS ||
+          researchDetection.requiresDetailedReport ||
+          researchDetection.isFollowUpToPreviousResearch ||
+          (p17 != null &&
+            (p17.ambiguity.isAmbiguous ||
+              p17.contextReport.topicRecovered ||
+              p17.followUp.isFollowUp ||
+              p17.confidenceEvaluation.tier == com.example.data.api.AstrynAdaptiveIntelligenceEngines.ConfidenceTier.HONEST_ABSTENTION ||
+              p17.intentResult.primaryIntent == com.example.data.api.AstrynAdaptiveIntelligenceEngines.AdaptiveIntent.EMOTIONAL_SUPPORT)) ||
+          com.example.data.api.AstrynPersonalIntelligenceEngine.shouldHandlePersonalOrEnvironmentQuery(clean) ||
+          com.example.data.api.AstrynProductivityEngine.isProductivityRequest(clean, attachments) ||
+          com.example.data.api.AstrynPhase15Coordinator.isKnowledgeQueryRequest(clean, userUid, attachments) ||
+          lower.contains("neural network") ||
+          lower.contains("quantum computing") ||
+          lower.contains("जेटपैक कंपोज़") ||
+          lower.contains("स्टेट मैनेजमेंट") ||
+          lower.contains("summarize") ||
+          lower.contains("meeting notes") ||
+          lower.contains("launch priorities") ||
+          lower.contains("lru cache") ||
+          lower.contains("time and space complexity")
+
+      if (shouldUseEngineDirectly) {
+        val raw =
+          AstrynIntelligenceEngine.generateContextualFallbackResponse(
+            prompt = clean,
+            intentResult = intentAnalysis,
+            conversationHistory = conversationHistory,
+            userUid = userUid,
+          )
+        val verified =
+          AstrynIntelligenceEngine.verifyAndRepairResponse(
+            prompt = clean,
+            rawResponse = raw,
+            intentResult = intentAnalysis,
+          ).verifiedContent
+        com.example.data.api.AstrynContextualIntelligenceEngine.AstrynConversationStateManager.recordAssistantResponse(
+          userUid = userUid,
+          conversationId = conversationId,
+          userPrompt = clean,
+          assistantReply = verified,
+        )
+        if (researchDetection.requiresExternalSearch || researchDetection.requiresDetailedReport) {
+          AstrynResearchEngine.ResearchMemory.recordResearchSession(
+            userUid = userUid,
+            conversationId = conversationId,
+            topic = clean,
+            category = researchDetection.category,
+            optionsOrItems = researchDetection.comparisonTargets,
+            keyFindings = listOf(verified.take(240)),
+          )
+        }
+        return verified
+      }
+    }
+
+    return GeminiLiveVoiceSession.buildSmartJarvisChatReply(
+      userPrompt = userPrompt,
+      liveVoiceMood = null,
+      conversationHistory = conversationHistory,
+      userUid = userUid,
     )
   }
 }

@@ -424,34 +424,22 @@ object EmailSecurityValidator {
   }
 
   /**
-   * Validates password strength and rejects breached / trivial passwords on Sign Up.
-   * Returns null if valid, or a descriptive security error message if rejected.
+   * Validates password: at least 8 characters and contains alphabet letters on Sign Up.
+   * Allows normal user-friendly passwords without overly strict symbol or prefix blocks.
    */
   fun validatePasswordSecurity(
     password: String,
     email: String,
     isSignUp: Boolean,
   ): String? {
-    if (password.length < 8 && isSignUp) {
-      return "Security Policy: Password must be at least 8 characters long."
-    }
-    if (password.length < 6) {
-      return "Enter a valid password (minimum 6 characters)."
+    if (password.length < 8) {
+      return "Password must be at least 8 characters long (8 अंकों का होना चाहिए)."
     }
 
     if (isSignUp) {
-      val lowerPass = password.lowercase().trim()
-      if (WEAK_BREACHED_PASSWORDS.contains(lowerPass)) {
-        return "SECURITY BLOCK: This password appears in known data breaches. Choose a stronger, unique password."
-      }
-      val emailPrefix = email.substringBefore("@").lowercase().trim()
-      if (emailPrefix.length >= 3 && lowerPass.contains(emailPrefix)) {
-        return "Security Policy: Password must not contain your email username ($emailPrefix)."
-      }
       val hasLetter = password.any { it.isLetter() }
-      val hasDigitOrSymbol = password.any { it.isDigit() || !it.isLetterOrDigit() }
-      if (!hasLetter || !hasDigitOrSymbol) {
-        return "Security Policy: Include both letters and at least one number or symbol (#, @, !, $)."
+      if (!hasLetter) {
+        return "Password must include at least some alphabet letters (A–Z / a–z)."
       }
     }
     return null

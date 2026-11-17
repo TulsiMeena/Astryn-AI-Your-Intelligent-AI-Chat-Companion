@@ -26,15 +26,21 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.WrapText
 import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.CheckBox
+import androidx.compose.material.icons.outlined.CheckBoxOutlineBlank
 import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.FormatListNumbered
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.Lightbulb
 import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
@@ -102,18 +108,63 @@ sealed class MarkdownBlock {
   data class BulletList(val items: List<String>) : MarkdownBlock()
 
   @Immutable
+  data class NestedBulletList(val items: List<NestedListEntry>) : MarkdownBlock()
+
+  @Immutable
+  data class Checklist(val items: List<ChecklistEntry>) : MarkdownBlock()
+
+  @Immutable
   data class OrderedList(val items: List<Pair<Int, String>>) : MarkdownBlock()
 
   @Immutable
   data class Blockquote(val text: String) : MarkdownBlock()
 
   @Immutable
-  data class Table(val headers: List<String>, val rows: List<List<String>>) : MarkdownBlock()
+  data class Callout(
+    val kind: CalloutKind,
+    val title: String,
+    val body: String,
+  ) : MarkdownBlock()
+
+  @Immutable
+  data class CopyableBlock(
+    val category: CopyBlockCategory,
+    val title: String,
+    val payload: String,
+    val blockIndex: Int,
+  ) : MarkdownBlock()
+
+  @Immutable
+  data class Table(
+    val headers: List<String>,
+    val rows: List<List<String>>,
+    val alignments: List<TableColumnAlignment> = emptyList(),
+  ) : MarkdownBlock()
 
   @Immutable
   data class CodeBlock(
     val language: String,
     val code: String,
+    val blockIndex: Int,
+  ) : MarkdownBlock()
+
+  @Immutable
+  data class MathFormula(
+    val latex: String,
+    val blockIndex: Int,
+  ) : MarkdownBlock()
+
+  @Immutable
+  data class Chart(
+    val rawSpec: String,
+    val parseResult: ChartParseResult,
+    val blockIndex: Int,
+  ) : MarkdownBlock()
+
+  @Immutable
+  data class Diagram(
+    val rawSource: String,
+    val parseResult: DiagramParseResult,
     val blockIndex: Int,
   ) : MarkdownBlock()
 
@@ -132,8 +183,9 @@ object SafeMarkdownParser {
   private const val MAX_CACHEABLE_MARKDOWN_LENGTH = 32_000
 
   private val HEADING_REGEX = Regex("""^(#{1,6})\s+(.+)$""")
-  private val BULLET_REGEX = Regex("""^\s*[-*+]\s+(.+)$""")
-  private val ORDERED_REGEX = Regex("""^\s*(\d+)\.\s+(.+)$""")
+  private val CHECKLIST_REGEX = Regex("""^(\s*)[-*+]\s+\[([ xX])\]\s+(.+)$""")
+  private val BULLET_REGEX = Regex("""^(\s*)[-*+]\s+(.+)$""")
+  private val ORDERED_REGEX = Regex("""^(\s*)(\d+)\.\s+(.+)$""")
   private val HR_REGEX = Regex("""^\s*([-*_])\1\1+\s*$""")
   private val TABLE_DIVIDER_REGEX = Regex("""^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*:?-{2,}:?\s*\|?\s*$""")
 
@@ -280,10 +332,10 @@ object SafeMarkdownParser {
    * or recomposition.
    * Preserves Unicode, Hindi (Devanagari), multiline formatting, and code indentation.
    */
-  fun parseBlocks(markdown: String): List<MarkdownBlock> {
+  fun parseBlocks(markdown: String, cacheResult: Boolean = true): List<MarkdownBlock> {
     if (markdown.isEmpty()) return emptyList()
 
-    val isCacheable = markdown.length <= MAX_CACHEABLE_MARKDOWN_LENGTH
+    val isCacheable = cacheResult && markdown.length <= MAX_CACHEABLE_MARKDOWN_LENGTH
     if (isCacheable) {
       synchronized(blockLruCache) {
         blockLruCache[markdown]?.let { cached ->
@@ -291,8 +343,15 @@ object SafeMarkdownParser {
           return cached
         }
       }
+      blockCacheMisses.incrementAndGet()
+    } else if (markdown.length <= MAX_CACHEABLE_MARKDOWN_LENGTH) {
+      synchronized(blockLruCache) {
+        blockLruCache[markdown]?.let { cached ->
+          blockCacheHits.incrementAndGet()
+          return cached
+        }
+      }
     }
-    blockCacheMisses.incrementAndGet()
 
     val normalized =
       if (markdown.contains('\r')) {
@@ -305,6 +364,11 @@ object SafeMarkdownParser {
 
     var i = 0
     var codeBlockCounter = 0
+    var copyBlockCounter = 0
+    var mathBlockCounter = 0
+    var chartBlockCounter = 0
+    var diagramBlockCounter = 0
+    var lastHeadingText: String? = null
 
     while (i < lines.size) {
       val line = lines[i]
@@ -318,28 +382,106 @@ object SafeMarkdownParser {
 
       val firstChar = trimmed[0]
 
-      // 2. Fenced code block (``` or ~~~)
+      // 2. Fenced blocks (``` or ~~~): Code, Chart, Diagram, Math, or Copyable Content
       if (
         (firstChar == '`' && trimmed.startsWith("```")) ||
           (firstChar == '~' && trimmed.startsWith("~~~"))
       ) {
         val fence = if (firstChar == '`') "```" else "~~~"
         val language = trimmed.removePrefix(fence).trim().lowercase()
-        val codeLines = mutableListOf<String>()
+        val bodyLines = mutableListOf<String>()
         i++
         while (i < lines.size && !lines[i].trim().startsWith(fence)) {
-          codeLines.add(lines[i])
+          bodyLines.add(lines[i])
           i++
         }
-        // Skip closing fence if present
         if (i < lines.size && lines[i].trim().startsWith(fence)) {
           i++
         }
+        val rawBody = bodyLines.joinToString("\n")
+        when (language) {
+          "chart", "astryn-chart", "graph-data" -> {
+            blocks.add(
+              MarkdownBlock.Chart(
+                rawSpec = rawBody,
+                parseResult = AstrynChartParser.parseChartBlock(rawBody),
+                blockIndex = chartBlockCounter++,
+              )
+            )
+          }
+          "mermaid", "flowchart", "diagram" -> {
+            blocks.add(
+              MarkdownBlock.Diagram(
+                rawSource = rawBody,
+                parseResult = AstrynDiagramParser.parseDiagram(rawBody),
+                blockIndex = diagramBlockCounter++,
+              )
+            )
+          }
+          "math", "latex", "tex" -> {
+            blocks.add(
+              MarkdownBlock.MathFormula(
+                latex = rawBody,
+                blockIndex = mathBlockCounter++,
+              )
+            )
+          }
+          else -> {
+            val copyCategory =
+              AstrynResponseFormatEngine.detectCopyableFenceCategory(
+                fenceLanguage = language,
+                body = rawBody,
+                precedingHeading = lastHeadingText,
+              )
+            if (copyCategory != null) {
+              blocks.add(
+                MarkdownBlock.CopyableBlock(
+                  category = copyCategory,
+                  title = copyCategory.displayLabel,
+                  payload = AstrynRichTextSanitizer.sanitizeClipboardPayload(rawBody),
+                  blockIndex = copyBlockCounter++,
+                )
+              )
+            } else {
+              blocks.add(
+                MarkdownBlock.CodeBlock(
+                  language = language.ifBlank { "code" },
+                  code = rawBody,
+                  blockIndex = codeBlockCounter++,
+                )
+              )
+            }
+          }
+        }
+        continue
+      }
+
+      // 2b. Display Math Block ($$ ... $$ or \[ ... \])
+      if (trimmed.startsWith("$$") || trimmed.startsWith("\\[")) {
+        val endDelimiter = if (trimmed.startsWith("$$")) "$$" else "\\]"
+        if (trimmed.length > 2 && trimmed.endsWith(endDelimiter)) {
+          val expr = trimmed.removePrefix(if (endDelimiter == "$$") "$$" else "\\[").removeSuffix(endDelimiter).trim()
+          blocks.add(MarkdownBlock.MathFormula(latex = expr, blockIndex = mathBlockCounter++))
+          i++
+          continue
+        }
+        val mathLines = mutableListOf<String>()
+        val firstRemainder = trimmed.removePrefix(if (endDelimiter == "$$") "$$" else "\\[").trim()
+        if (firstRemainder.isNotEmpty()) mathLines.add(firstRemainder)
+        i++
+        while (i < lines.size && !lines[i].trim().endsWith(endDelimiter)) {
+          mathLines.add(lines[i])
+          i++
+        }
+        if (i < lines.size && lines[i].trim().endsWith(endDelimiter)) {
+          val lastSeg = lines[i].trim().removeSuffix(endDelimiter).trim()
+          if (lastSeg.isNotEmpty()) mathLines.add(lastSeg)
+          i++
+        }
         blocks.add(
-          MarkdownBlock.CodeBlock(
-            language = language.ifBlank { "code" },
-            code = codeLines.joinToString("\n"),
-            blockIndex = codeBlockCounter++,
+          MarkdownBlock.MathFormula(
+            latex = mathLines.joinToString("\n").trim(),
+            blockIndex = mathBlockCounter++,
           )
         )
         continue
@@ -361,7 +503,8 @@ object SafeMarkdownParser {
         val headingMatch = HEADING_REGEX.matchEntire(trimmed)
         if (headingMatch != null) {
           val level = headingMatch.groupValues[1].length.coerceIn(1, 6)
-          val headingText = headingMatch.groupValues[2].trim()
+          val headingText = AstrynRichTextSanitizer.sanitizeDangerousHtml(headingMatch.groupValues[2].trim())
+          lastHeadingText = headingText
           blocks.add(MarkdownBlock.Heading(level = level, text = headingText))
           i++
           continue
@@ -374,70 +517,136 @@ object SafeMarkdownParser {
           i + 1 < lines.size &&
           TABLE_DIVIDER_REGEX.matches(lines[i + 1].trim())
       ) {
-        val headers = parseTableRow(lines[i])
+        val headers = parseTableRow(lines[i]).map { AstrynRichTextSanitizer.sanitizeDangerousHtml(it) }
+        val dividerAlignments = AstrynResponseFormatEngine.parseTableAlignments(lines[i + 1], headers.size)
         i += 2 // Skip header and divider row
         val rows = mutableListOf<List<String>>()
         while (i < lines.size && lines[i].trim().let { it.isNotEmpty() && it.contains('|') }) {
-          val rowCells = parseTableRow(lines[i])
+          val rowCells = parseTableRow(lines[i]).map { AstrynRichTextSanitizer.sanitizeDangerousHtml(it) }
           if (rowCells.isNotEmpty()) {
             rows.add(rowCells)
           }
           i++
         }
         if (headers.isNotEmpty()) {
-          blocks.add(MarkdownBlock.Table(headers = headers, rows = rows))
+          val effectiveAlignments =
+            AstrynResponseFormatEngine.resolveEffectiveTableAlignments(
+              explicitAlignments = dividerAlignments,
+              headers = headers,
+              rows = rows,
+            )
+          blocks.add(
+            MarkdownBlock.Table(
+              headers = headers,
+              rows = rows,
+              alignments = effectiveAlignments,
+            )
+          )
           continue
         }
       }
 
-      // 6. Blockquote (> ...)
+      // 6. Blockquote (> ...) or Explicit Callout (> [!NOTE] / > **Warning:** ...)
       if (firstChar == '>') {
         val quoteLines = mutableListOf<String>()
         while (i < lines.size && lines[i].trim().startsWith(">")) {
-          quoteLines.add(lines[i].trim().removePrefix(">").trimStart())
+          quoteLines.add(AstrynRichTextSanitizer.sanitizeDangerousHtml(lines[i].trim().removePrefix(">").trimStart()))
           i++
         }
-        blocks.add(MarkdownBlock.Blockquote(text = quoteLines.joinToString("\n")))
+        val callout = AstrynResponseFormatEngine.detectCalloutFromQuoteLines(quoteLines)
+        if (callout != null) {
+          blocks.add(MarkdownBlock.Callout(kind = callout.first, title = callout.second, body = callout.third))
+        } else {
+          blocks.add(MarkdownBlock.Blockquote(text = quoteLines.joinToString("\n")))
+        }
         continue
       }
 
-      // 7. Unordered List (-, *, +)
-      if (
-        (firstChar == '-' || firstChar == '*' || firstChar == '+') &&
-          BULLET_REGEX.matches(line)
-      ) {
-        val items = mutableListOf<String>()
+      // 7a. Checklist (- [ ] / - [x])
+      if ((firstChar == '-' || firstChar == '*' || firstChar == '+') && CHECKLIST_REGEX.matches(line)) {
+        val items = mutableListOf<ChecklistEntry>()
         while (i < lines.size) {
-          val m = BULLET_REGEX.matchEntire(lines[i])
-          if (m != null) {
-            items.add(m.groupValues[1].trim())
+          val cm = CHECKLIST_REGEX.matchEntire(lines[i])
+          if (cm != null) {
+            val indent = (cm.groupValues[1].length / 2).coerceIn(0, 3)
+            val checked = cm.groupValues[2].equals("x", ignoreCase = true)
+            val text = AstrynRichTextSanitizer.sanitizeDangerousHtml(cm.groupValues[3].trim())
+            items.add(ChecklistEntry(indentLevel = indent, checked = checked, text = text))
             i++
           } else {
             break
           }
         }
-        blocks.add(MarkdownBlock.BulletList(items = items))
+        blocks.add(MarkdownBlock.Checklist(items = items))
         continue
       }
 
-      // 8. Ordered List (1., 2., ...)
+      // 7b. Unordered / Nested List (-, *, +)
+      if ((firstChar == '-' || firstChar == '*' || firstChar == '+') && BULLET_REGEX.matches(line)) {
+        val nestedEntries = mutableListOf<NestedListEntry>()
+        var hasSubIndentation = false
+        while (i < lines.size) {
+          if (CHECKLIST_REGEX.matches(lines[i])) break
+          val bm = BULLET_REGEX.matchEntire(lines[i])
+          if (bm != null) {
+            val indent = (bm.groupValues[1].length / 2).coerceIn(0, 3)
+            if (indent > 0) hasSubIndentation = true
+            val itemText = AstrynRichTextSanitizer.sanitizeDangerousHtml(bm.groupValues[2].trim())
+            nestedEntries.add(NestedListEntry(indentLevel = indent, text = itemText, isOrdered = false))
+            i++
+          } else if (nestedEntries.isNotEmpty() && lines[i].startsWith("  ") && ORDERED_REGEX.matches(lines[i])) {
+            val om = ORDERED_REGEX.matchEntire(lines[i]) ?: break
+            val indent = (om.groupValues[1].length / 2).coerceIn(1, 3)
+            hasSubIndentation = true
+            val num = om.groupValues[2].toIntOrNull() ?: 1
+            val itemText = AstrynRichTextSanitizer.sanitizeDangerousHtml(om.groupValues[3].trim())
+            nestedEntries.add(NestedListEntry(indentLevel = indent, text = itemText, isOrdered = true, orderNumber = num))
+            i++
+          } else {
+            break
+          }
+        }
+        if (hasSubIndentation) {
+          blocks.add(MarkdownBlock.NestedBulletList(items = nestedEntries))
+        } else {
+          blocks.add(MarkdownBlock.BulletList(items = nestedEntries.map { it.text }))
+        }
+        continue
+      }
+
+      // 8. Ordered List (1., 2., ...) with optional indented sub-bullets
       if (firstChar.isDigit() && ORDERED_REGEX.matches(line)) {
-        val items = mutableListOf<Pair<Int, String>>()
+        val rawEntries = mutableListOf<NestedListEntry>()
+        var hasSubIndentation = false
         while (i < lines.size) {
-          val m = ORDERED_REGEX.matchEntire(lines[i])
-          if (m != null) {
-            val number = m.groupValues[1].toIntOrNull() ?: (items.size + 1)
-            items.add(number to m.groupValues[2].trim())
+          val om = ORDERED_REGEX.matchEntire(lines[i])
+          if (om != null) {
+            val indent = (om.groupValues[1].length / 2).coerceIn(0, 3)
+            if (indent > 0) hasSubIndentation = true
+            val number = om.groupValues[2].toIntOrNull() ?: (rawEntries.size + 1)
+            val txt = AstrynRichTextSanitizer.sanitizeDangerousHtml(om.groupValues[3].trim())
+            rawEntries.add(NestedListEntry(indentLevel = indent, text = txt, isOrdered = true, orderNumber = number))
+            i++
+          } else if (rawEntries.isNotEmpty() && lines[i].startsWith("  ") && BULLET_REGEX.matches(lines[i])) {
+            val bm = BULLET_REGEX.matchEntire(lines[i]) ?: break
+            val indent = (bm.groupValues[1].length / 2).coerceIn(1, 3)
+            hasSubIndentation = true
+            val txt = AstrynRichTextSanitizer.sanitizeDangerousHtml(bm.groupValues[2].trim())
+            rawEntries.add(NestedListEntry(indentLevel = indent, text = txt, isOrdered = false))
             i++
           } else {
             break
           }
         }
-        blocks.add(MarkdownBlock.OrderedList(items = items))
+        if (hasSubIndentation) {
+          blocks.add(MarkdownBlock.NestedBulletList(items = rawEntries))
+        } else {
+          blocks.add(MarkdownBlock.OrderedList(items = rawEntries.map { it.orderNumber to it.text }))
+        }
         continue
       }
 
-      // 9. Standard Paragraph (accumulate consecutive non-special lines with fast char pre-checks)
+      // 9. Standard Paragraph (accumulate consecutive non-special lines with HTML sanitization)
       val paragraphLines = mutableListOf<String>()
       while (i < lines.size) {
         val current = lines[i]
@@ -448,10 +657,11 @@ object SafeMarkdownParser {
           when {
             fc == '`' && curTrim.startsWith("```") -> true
             fc == '~' && curTrim.startsWith("~~~") -> true
+            curTrim.startsWith("$$") || curTrim.startsWith("\\[") -> true
             fc == '#' && HEADING_REGEX.matches(curTrim) -> true
             fc == '>' -> true
             (fc == '-' || fc == '*' || fc == '_') && curTrim.length >= 3 && HR_REGEX.matches(curTrim) -> true
-            (fc == '-' || fc == '*' || fc == '+') && BULLET_REGEX.matches(current) -> true
+            (fc == '-' || fc == '*' || fc == '+') && (CHECKLIST_REGEX.matches(current) || BULLET_REGEX.matches(current)) -> true
             fc.isDigit() && ORDERED_REGEX.matches(current) -> true
             curTrim.contains('|') &&
               i + 1 < lines.size &&
@@ -461,12 +671,30 @@ object SafeMarkdownParser {
         if (isSpecialBlockStart) {
           break
         }
-        paragraphLines.add(current)
+        val cleanedLine = AstrynRichTextSanitizer.sanitizeDangerousHtml(current)
+        if (cleanedLine.isNotEmpty()) {
+          paragraphLines.add(cleanedLine)
+        }
         i++
       }
       if (paragraphLines.isNotEmpty()) {
-        blocks.add(MarkdownBlock.Paragraph(text = paragraphLines.joinToString("\n")))
-      } else {
+        val joined = paragraphLines.joinToString("\n")
+        val calloutPrefix =
+          if (joined.startsWith("**Warning:**", ignoreCase = true) ||
+            joined.startsWith("**Note:**", ignoreCase = true) ||
+            joined.startsWith("**Tip:**", ignoreCase = true) ||
+            joined.startsWith("**Important:**", ignoreCase = true)
+          ) {
+            AstrynResponseFormatEngine.detectCalloutFromQuoteLines(listOf(joined))
+          } else null
+
+        if (calloutPrefix != null) {
+          blocks.add(MarkdownBlock.Callout(calloutPrefix.first, calloutPrefix.second, calloutPrefix.third))
+        } else {
+          blocks.add(MarkdownBlock.Paragraph(text = joined))
+        }
+      } else if (i < lines.size && paragraphLines.isEmpty() && lines[i].trim().isNotEmpty()) {
+        // Pure stripped dangerous line; advance safely
         i++
       }
     }
@@ -488,6 +716,8 @@ object SafeMarkdownParser {
 
 /**
  * Renders structured Markdown content safely inside a user or assistant message bubble.
+ * During active token streaming ([isStreaming] == true), skips [SelectionContainer] registration
+ * overhead for 120Hz zero-lag frame rendering and appends a smooth glowing AI cursor (`▍`).
  */
 @Composable
 fun MarkdownMessageContent(
@@ -498,20 +728,35 @@ fun MarkdownMessageContent(
   textColorOverride: Color? = null,
   onDownloadCode: ((code: String, language: String) -> Unit)? = null,
   onRunCode: ((code: String, language: String) -> Unit)? = null,
+  isStreaming: Boolean = false,
 ) {
-  val blocks = remember(content) { SafeMarkdownParser.parseBlocks(content) }
+  val effectiveMarkdown =
+    remember(content, isStreaming) {
+      if (isStreaming) {
+        AstrynResponseFormatEngine.buildStreamingSafePreview(content).safeMarkdown
+      } else {
+        content
+      }
+    }
 
-  SelectionContainer {
+  val blocks =
+    remember(effectiveMarkdown, isStreaming) {
+      SafeMarkdownParser.parseBlocks(effectiveMarkdown, cacheResult = !isStreaming)
+    }
+
+  val markdownBlocksColumn: @Composable () -> Unit = {
     Column(
       modifier = modifier.fillMaxWidth(),
       verticalArrangement = Arrangement.spacedBy(AppSpacing.sm),
     ) {
+      val lastIndex = blocks.lastIndex
       blocks.forEachIndexed { index, block ->
+        val isTrailingStreamingBlock = isStreaming && index == lastIndex
         when (block) {
           is MarkdownBlock.Heading -> {
             MarkdownHeadingItem(
               level = block.level,
-              text = block.text,
+              text = if (isTrailingStreamingBlock) "${block.text} ▍" else block.text,
               textColorOverride = textColorOverride,
               modifier = Modifier.testTag("md_heading_${messageId}_$index"),
             )
@@ -519,7 +764,7 @@ fun MarkdownMessageContent(
 
           is MarkdownBlock.Paragraph -> {
             MarkdownInlineText(
-              text = block.text,
+              text = if (isTrailingStreamingBlock) "${block.text} ▍" else block.text,
               style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 22.sp),
               textColorOverride = textColorOverride,
               modifier = Modifier.testTag("md_paragraph_${messageId}_$index"),
@@ -527,16 +772,45 @@ fun MarkdownMessageContent(
           }
 
           is MarkdownBlock.BulletList -> {
+            val itemsToRender =
+              if (isTrailingStreamingBlock && block.items.isNotEmpty()) {
+                block.items.dropLast(1) + ("${block.items.last()} ▍")
+              } else {
+                block.items
+              }
             MarkdownBulletList(
-              items = block.items,
+              items = itemsToRender,
               textColorOverride = textColorOverride,
               modifier = Modifier.testTag("md_bullet_list_${messageId}_$index"),
             )
           }
 
-          is MarkdownBlock.OrderedList -> {
-            MarkdownOrderedList(
+          is MarkdownBlock.NestedBulletList -> {
+            MarkdownNestedBulletList(
               items = block.items,
+              textColorOverride = textColorOverride,
+              modifier = Modifier.testTag("md_nested_list_${messageId}_$index"),
+            )
+          }
+
+          is MarkdownBlock.Checklist -> {
+            MarkdownChecklistBlock(
+              items = block.items,
+              textColorOverride = textColorOverride,
+              modifier = Modifier.testTag("md_checklist_${messageId}_$index"),
+            )
+          }
+
+          is MarkdownBlock.OrderedList -> {
+            val itemsToRender =
+              if (isTrailingStreamingBlock && block.items.isNotEmpty()) {
+                val lastPair = block.items.last()
+                block.items.dropLast(1) + (lastPair.first to "${lastPair.second} ▍")
+              } else {
+                block.items
+              }
+            MarkdownOrderedList(
+              items = itemsToRender,
               textColorOverride = textColorOverride,
               modifier = Modifier.testTag("md_ordered_list_${messageId}_$index"),
             )
@@ -544,28 +818,91 @@ fun MarkdownMessageContent(
 
           is MarkdownBlock.Blockquote -> {
             MarkdownBlockquoteItem(
-              text = block.text,
+              text = if (isTrailingStreamingBlock) "${block.text} ▍" else block.text,
               textColorOverride = textColorOverride,
               modifier = Modifier.testTag("md_blockquote_${messageId}_$index"),
             )
+          }
+
+          is MarkdownBlock.Callout -> {
+            MarkdownCalloutCard(
+              kind = block.kind,
+              title = block.title,
+              body = if (isTrailingStreamingBlock) "${block.body} ▍" else block.body,
+              modifier = Modifier.testTag("md_callout_${messageId}_$index"),
+            )
+          }
+
+          is MarkdownBlock.CopyableBlock -> {
+            val card: @Composable () -> Unit = {
+              MarkdownCopyBlockCard(
+                messageId = messageId,
+                block = block,
+                onCopyPayload = onCopyCode,
+              )
+            }
+            if (isStreaming) card()
+            else androidx.compose.foundation.text.selection.DisableSelection { card() }
           }
 
           is MarkdownBlock.Table -> {
             MarkdownTableItem(
               headers = block.headers,
               rows = block.rows,
+              alignments = block.alignments,
               modifier = Modifier.testTag("md_table_${messageId}_$index"),
             )
           }
 
           is MarkdownBlock.CodeBlock -> {
-            androidx.compose.foundation.text.selection.DisableSelection {
+            if (isStreaming) {
               MarkdownCodeBlockCard(
                 messageId = messageId,
                 block = block,
                 onCopyCode = onCopyCode,
                 onDownloadCode = onDownloadCode,
                 onRunCode = onRunCode,
+              )
+            } else {
+              androidx.compose.foundation.text.selection.DisableSelection {
+                MarkdownCodeBlockCard(
+                  messageId = messageId,
+                  block = block,
+                  onCopyCode = onCopyCode,
+                  onDownloadCode = onDownloadCode,
+                  onRunCode = onRunCode,
+                )
+              }
+            }
+          }
+
+          is MarkdownBlock.MathFormula -> {
+            androidx.compose.foundation.text.selection.DisableSelection {
+              AstrynMathFormulaCard(
+                messageId = messageId,
+                blockIndex = block.blockIndex,
+                rawLatex = block.latex,
+                onCopyFormula = onCopyCode,
+              )
+            }
+          }
+
+          is MarkdownBlock.Chart -> {
+            androidx.compose.foundation.text.selection.DisableSelection {
+              AstrynChartCard(
+                messageId = messageId,
+                blockIndex = block.blockIndex,
+                parseResult = block.parseResult,
+              )
+            }
+          }
+
+          is MarkdownBlock.Diagram -> {
+            androidx.compose.foundation.text.selection.DisableSelection {
+              AstrynDiagramCard(
+                messageId = messageId,
+                blockIndex = block.blockIndex,
+                parseResult = block.parseResult,
               )
             }
           }
@@ -575,6 +912,14 @@ fun MarkdownMessageContent(
           }
         }
       }
+    }
+  }
+
+  if (isStreaming) {
+    markdownBlocksColumn()
+  } else {
+    SelectionContainer {
+      markdownBlocksColumn()
     }
   }
 }
@@ -709,73 +1054,368 @@ private fun MarkdownBlockquoteItem(
 }
 
 @Composable
+private fun MarkdownNestedBulletList(
+  items: List<NestedListEntry>,
+  modifier: Modifier = Modifier,
+  textColorOverride: Color? = null,
+) {
+  val glass = AppThemeTokens.glass
+  Column(
+    modifier = modifier.fillMaxWidth(),
+    verticalArrangement = Arrangement.spacedBy(5.dp),
+  ) {
+    items.forEach { entry ->
+      val startPad = (entry.indentLevel * 16).dp
+      val marker =
+        if (entry.isOrdered) "${entry.orderNumber}."
+        else when (entry.indentLevel) {
+          0 -> "•"
+          1 -> "◦"
+          else -> "▪"
+        }
+      Row(
+        modifier = Modifier.fillMaxWidth().padding(start = startPad),
+        verticalAlignment = Alignment.Top,
+      ) {
+        Text(
+          text = marker,
+          style = MaterialTheme.typography.bodyMedium,
+          fontWeight = FontWeight.Bold,
+          color = glass.accentCyan,
+          modifier = Modifier.widthIn(min = 18.dp).padding(end = 6.dp),
+        )
+        MarkdownInlineText(
+          text = entry.text,
+          style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 22.sp),
+          textColorOverride = textColorOverride,
+          modifier = Modifier.weight(1f),
+        )
+      }
+    }
+  }
+}
+
+@Composable
+private fun MarkdownChecklistBlock(
+  items: List<ChecklistEntry>,
+  modifier: Modifier = Modifier,
+  textColorOverride: Color? = null,
+) {
+  val glass = AppThemeTokens.glass
+  Column(
+    modifier = modifier.fillMaxWidth(),
+    verticalArrangement = Arrangement.spacedBy(6.dp),
+  ) {
+    items.forEach { entry ->
+      val startPad = (entry.indentLevel * 16).dp
+      Row(
+        modifier = Modifier.fillMaxWidth().padding(start = startPad),
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+      ) {
+        Icon(
+          imageVector =
+            if (entry.checked) Icons.Outlined.CheckBox else Icons.Outlined.CheckBoxOutlineBlank,
+          contentDescription = if (entry.checked) "Checked" else "Unchecked",
+          tint = if (entry.checked) glass.statusSuccess else glass.accentCyan,
+          modifier = Modifier.padding(top = 2.dp).size(17.dp),
+        )
+        MarkdownInlineText(
+          text = entry.text,
+          style =
+            MaterialTheme.typography.bodyMedium.copy(
+              lineHeight = 22.sp,
+              textDecoration = if (entry.checked) TextDecoration.LineThrough else TextDecoration.None,
+            ),
+          textColorOverride =
+            if (entry.checked) (textColorOverride ?: glass.textSecondary).copy(alpha = 0.72f)
+            else textColorOverride,
+          modifier = Modifier.weight(1f),
+        )
+      }
+    }
+  }
+}
+
+@Composable
+private fun MarkdownCalloutCard(
+  kind: CalloutKind,
+  title: String,
+  body: String,
+  modifier: Modifier = Modifier,
+) {
+  val glass = AppThemeTokens.glass
+  val accentColor =
+    when (kind) {
+      CalloutKind.WARNING, CalloutKind.CONS -> glass.statusWarning
+      CalloutKind.PROS, CalloutKind.TIP -> glass.statusSuccess
+      CalloutKind.IMPORTANT -> glass.accentPrimary
+      CalloutKind.NOTE, CalloutKind.DEFINITION, CalloutKind.SUMMARY -> glass.accentCyan
+    }
+  val iconVector =
+    when (kind) {
+      CalloutKind.WARNING -> Icons.Outlined.WarningAmber
+      CalloutKind.TIP -> Icons.Outlined.Lightbulb
+      else -> Icons.Outlined.Info
+    }
+
+  Column(
+    modifier =
+      modifier
+        .fillMaxWidth()
+        .clip(RoundedCornerShape(12.dp))
+        .background(accentColor.copy(alpha = 0.09f))
+        .border(AppBorder.hairline, accentColor.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+        .padding(AppSpacing.sm),
+    verticalArrangement = Arrangement.spacedBy(4.dp),
+  ) {
+    Row(
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+      Icon(
+        imageVector = iconVector,
+        contentDescription = null,
+        tint = accentColor,
+        modifier = Modifier.size(15.dp),
+      )
+      Text(
+        text = title,
+        style = MaterialTheme.typography.labelMedium,
+        fontWeight = FontWeight.Bold,
+        color = accentColor,
+      )
+    }
+    MarkdownInlineText(
+      text = body,
+      style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 21.sp),
+    )
+  }
+}
+
+/**
+ * Dedicated copyable draft/template/prompt/command card preserving exact line breaks, indentation,
+ * and Unicode characters without leaking decorative UI chrome into the clipboard payload.
+ */
+@Composable
+fun MarkdownCopyBlockCard(
+  messageId: String,
+  block: MarkdownBlock.CopyableBlock,
+  onCopyPayload: (String) -> Unit,
+  modifier: Modifier = Modifier,
+) {
+  val glass = AppThemeTokens.glass
+  var copiedRecently by remember { mutableStateOf(false) }
+
+  LaunchedEffect(copiedRecently) {
+    if (copiedRecently) {
+      delay(2000L)
+      copiedRecently = false
+    }
+  }
+
+  Column(
+    modifier =
+      modifier
+        .fillMaxWidth()
+        .clip(RoundedCornerShape(14.dp))
+        .background(glass.surfaceElevated.copy(alpha = 0.80f))
+        .border(AppBorder.hairline, glass.accentCyan.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+        .testTag("copy_block_${messageId}_${block.blockIndex}"),
+  ) {
+    Row(
+      modifier =
+        Modifier.fillMaxWidth()
+          .background(glass.surfaceStandard.copy(alpha = 0.72f))
+          .padding(horizontal = AppSpacing.sm, vertical = 5.dp),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+      Text(
+        text = block.title.uppercase(),
+        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
+        fontWeight = FontWeight.Bold,
+        color = glass.accentCyan,
+      )
+      Row(
+        modifier =
+          Modifier.minimumInteractiveComponentSize()
+            .defaultMinSize(minHeight = 26.dp)
+            .clip(RoundedCornerShape(7.dp))
+            .background(
+              if (copiedRecently) glass.statusSuccess.copy(alpha = 0.18f)
+              else glass.surfaceElevated.copy(alpha = 0.8f)
+            )
+            .border(
+              AppBorder.hairline,
+              if (copiedRecently) glass.statusSuccess else glass.borderSubtle,
+              RoundedCornerShape(7.dp),
+            )
+            .semantics {
+              role = Role.Button
+              contentDescription = if (copiedRecently) "Copied to clipboard" else "Copy ${block.title}"
+            }
+            .clickable {
+              onCopyPayload(block.payload)
+              copiedRecently = true
+            }
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .testTag("copy_block_button_${messageId}_${block.blockIndex}"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+      ) {
+        Icon(
+          imageVector = if (copiedRecently) Icons.Outlined.Check else Icons.Outlined.ContentCopy,
+          contentDescription = null,
+          tint = if (copiedRecently) glass.statusSuccess else glass.accentCyan,
+          modifier = Modifier.size(12.dp),
+        )
+        Text(
+          text = if (copiedRecently) "Copied" else "Copy",
+          style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
+          fontWeight = FontWeight.SemiBold,
+          color = if (copiedRecently) glass.statusSuccess else glass.textPrimary,
+        )
+      }
+    }
+    GlassDivider()
+    SelectionContainer {
+      Text(
+        text = block.payload,
+        style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 21.sp),
+        color = glass.textPrimary,
+        modifier = Modifier.fillMaxWidth().padding(AppSpacing.md),
+      )
+    }
+  }
+}
+
+private const val DEFAULT_VISIBLE_TABLE_ROWS = 25
+
+@Composable
 private fun MarkdownTableItem(
   headers: List<String>,
   rows: List<List<String>>,
+  alignments: List<TableColumnAlignment> = emptyList(),
   modifier: Modifier = Modifier,
 ) {
   val glass = AppThemeTokens.glass
   val horizontalScroll = rememberScrollState()
+  var showAllRows by rememberSaveable(headers, rows.size) { mutableStateOf(false) }
 
-  Box(
+  val effectiveAlignments =
+    remember(headers, rows, alignments) {
+      AstrynResponseFormatEngine.resolveEffectiveTableAlignments(alignments, headers, rows)
+    }
+
+  val displayedRows =
+    if (showAllRows || rows.size <= DEFAULT_VISIBLE_TABLE_ROWS) {
+      rows
+    } else {
+      rows.take(DEFAULT_VISIBLE_TABLE_ROWS)
+    }
+
+  Column(
     modifier =
       modifier
         .fillMaxWidth()
         .clip(RoundedCornerShape(10.dp))
         .border(AppBorder.hairline, glass.borderSubtle, RoundedCornerShape(10.dp))
-        .background(glass.surfaceSubtle.copy(alpha = 0.7f))
-        .horizontalScroll(horizontalScroll)
+        .background(glass.surfaceSubtle.copy(alpha = 0.7f)),
   ) {
-    Column {
-      // Header Row
-      Row(
-        modifier =
-          Modifier.background(glass.surfaceElevated.copy(alpha = 0.9f))
-            .padding(vertical = 6.dp, horizontal = 4.dp),
-      ) {
-        headers.forEach { header ->
-          Box(
-            modifier =
-              Modifier.widthIn(min = 96.dp, max = 220.dp)
-                .padding(horizontal = AppSpacing.sm, vertical = 2.dp),
-          ) {
-            MarkdownInlineText(
-              text = header,
-              style =
-                MaterialTheme.typography.labelMedium.copy(
-                  fontWeight = FontWeight.Bold,
-                  color = glass.accentCyan,
-                ),
-            )
-          }
-        }
-      }
-
-      // Data Rows
-      rows.forEachIndexed { rowIndex, rowCells ->
-        GlassDivider()
+    Box(
+      modifier = Modifier.fillMaxWidth().horizontalScroll(horizontalScroll),
+    ) {
+      Column {
+        // Header Row
         Row(
           modifier =
-            Modifier.background(
-                if (rowIndex % 2 == 0) Color.Transparent
-                else glass.surfaceStandard.copy(alpha = 0.35f)
-              )
+            Modifier.background(glass.surfaceElevated.copy(alpha = 0.9f))
               .padding(vertical = 6.dp, horizontal = 4.dp),
         ) {
-          headers.indices.forEach { colIndex ->
-            val cellText = rowCells.getOrNull(colIndex).orEmpty()
+          headers.forEachIndexed { colIndex, header ->
+            val align = effectiveAlignments.getOrNull(colIndex) ?: TableColumnAlignment.LEFT
+            val textAlign =
+              when (align) {
+                TableColumnAlignment.RIGHT -> TextAlign.End
+                TableColumnAlignment.CENTER -> TextAlign.Center
+                TableColumnAlignment.LEFT -> TextAlign.Start
+              }
             Box(
               modifier =
-                Modifier.widthIn(min = 96.dp, max = 220.dp)
+                Modifier.widthIn(min = 92.dp, max = 230.dp)
                   .padding(horizontal = AppSpacing.sm, vertical = 2.dp),
             ) {
               MarkdownInlineText(
-                text = cellText,
-                style = MaterialTheme.typography.bodySmall,
+                text = header,
+                style =
+                  MaterialTheme.typography.labelMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    color = glass.accentCyan,
+                    textAlign = textAlign,
+                  ),
+                modifier = Modifier.fillMaxWidth(),
               )
             }
           }
         }
+
+        // Data Rows
+        displayedRows.forEachIndexed { rowIndex, rowCells ->
+          GlassDivider()
+          Row(
+            modifier =
+              Modifier.background(
+                  if (rowIndex % 2 == 0) Color.Transparent
+                  else glass.surfaceStandard.copy(alpha = 0.35f)
+                )
+                .padding(vertical = 6.dp, horizontal = 4.dp),
+          ) {
+            headers.indices.forEach { colIndex ->
+              val cellText = rowCells.getOrNull(colIndex).orEmpty()
+              val align = effectiveAlignments.getOrNull(colIndex) ?: TableColumnAlignment.LEFT
+              val textAlign =
+                when (align) {
+                  TableColumnAlignment.RIGHT -> TextAlign.End
+                  TableColumnAlignment.CENTER -> TextAlign.Center
+                  TableColumnAlignment.LEFT -> TextAlign.Start
+                }
+              Box(
+                modifier =
+                  Modifier.widthIn(min = 92.dp, max = 230.dp)
+                    .padding(horizontal = AppSpacing.sm, vertical = 2.dp),
+              ) {
+                MarkdownInlineText(
+                  text = cellText.ifEmpty { "—" },
+                  style = MaterialTheme.typography.bodySmall.copy(textAlign = textAlign),
+                  textColorOverride = if (cellText.isEmpty()) glass.textMuted else null,
+                  modifier = Modifier.fillMaxWidth(),
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (rows.size > DEFAULT_VISIBLE_TABLE_ROWS) {
+      GlassDivider()
+      Box(
+        modifier =
+          Modifier.fillMaxWidth()
+            .minimumInteractiveComponentSize()
+            .clickable { showAllRows = !showAllRows }
+            .padding(vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+      ) {
+        Text(
+          text =
+            if (showAllRows) "Show fewer rows"
+            else "Show all ${rows.size} rows (${rows.size - DEFAULT_VISIBLE_TABLE_ROWS} more)",
+          style = MaterialTheme.typography.labelSmall,
+          fontWeight = FontWeight.SemiBold,
+          color = glass.accentCyan,
+        )
       }
     }
   }
@@ -807,10 +1447,16 @@ fun MarkdownCodeBlockCard(
     }
   }
 
+  val langSpec =
+    remember(block.language) {
+      AstrynResponseFormatEngine.normalizeCodeLanguage(block.language)
+    }
+
   val highlightedCode =
     remember(block.code, block.language, glass.isDark) {
-      highlightCodeSyntax(
+      AstrynResponseFormatEngine.highlightCodeForLanguage(
         code = block.code,
+        language = block.language,
         isDark = glass.isDark,
         defaultTextColor = glass.textPrimary,
       )
@@ -861,7 +1507,7 @@ fun MarkdownCodeBlockCard(
           modifier = Modifier.size(13.dp),
         )
         Text(
-          text = block.language.uppercase(),
+          text = langSpec.displayName,
           style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
           fontWeight = FontWeight.Bold,
           color = glass.textSecondary,
@@ -1184,7 +1830,7 @@ private val INLINE_TOKEN_REGEX =
 private fun containsPotentialInlineMarkdown(raw: String): Boolean {
   for (i in 0 until raw.length) {
     when (raw[i]) {
-      '`', '*', '_', '~', '[', ':' -> return true
+      '`', '*', '_', '~', '[', ':', '$', '\\' -> return true
     }
   }
   return false
@@ -1206,14 +1852,32 @@ internal fun buildInlineMarkdownAnnotatedString(
     "$raw|${primaryColor.value}|${linkColor.value}|${inlineCodeBg.value}|${inlineCodeColor.value}"
   SafeMarkdownParser.getCachedInline(cacheKey)?.let { return it }
 
+  // First tokenize safe inline math ($...$ or \(...\)) outside currency expressions
+  val mathTokens = AstrynMathParser.tokenizeInlineMath(raw)
   val computed = buildAnnotatedString {
-    var cursor = 0
-    val matches = INLINE_TOKEN_REGEX.findAll(raw)
-
-    for (match in matches) {
-      if (match.range.first > cursor) {
-        append(raw.substring(cursor, match.range.first))
+    for (mathSeg in mathTokens) {
+      if (mathSeg.isMath) {
+        pushStyle(
+          SpanStyle(
+            fontFamily = FontFamily.Serif,
+            fontStyle = FontStyle.Italic,
+            fontWeight = FontWeight.Medium,
+            color = linkColor,
+          )
+        )
+        append(mathSeg.content)
+        pop()
+        continue
       }
+
+      val segment = mathSeg.content
+      var cursor = 0
+      val matches = INLINE_TOKEN_REGEX.findAll(segment)
+
+      for (match in matches) {
+        if (match.range.first > cursor) {
+          append(segment.substring(cursor, match.range.first))
+        }
 
       val token = match.value
       when {
@@ -1306,11 +1970,12 @@ internal fun buildInlineMarkdownAnnotatedString(
         else -> append(token)
       }
 
-      cursor = match.range.last + 1
-    }
+        cursor = match.range.last + 1
+      }
 
-    if (cursor < raw.length) {
-      append(raw.substring(cursor))
+      if (cursor < segment.length) {
+        append(segment.substring(cursor))
+      }
     }
   }
 

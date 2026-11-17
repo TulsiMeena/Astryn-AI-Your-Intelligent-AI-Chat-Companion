@@ -134,6 +134,15 @@ object FirebaseRestAuthClient {
     // 3. Check cached auto-discovered key from Firebase Hosting init.json
     cachedAutoDiscoveredApiKey?.takeIf { it.isNotBlank() }?.let { return it }
 
+    // 4. Fallback check: UserApiKeyManager if user saved an AIza... Google Cloud / Firebase key
+    val savedGoogleKey =
+      try {
+        com.example.data.local.UserApiKeyManager.getInstance().getDecryptedApiKey().orEmpty().trim()
+      } catch (_: Exception) {
+        ""
+      }
+    extractApiKeyFromSnippet(savedGoogleKey)?.let { return it }
+
     return null
   }
 
@@ -214,39 +223,9 @@ object FirebaseRestAuthClient {
 
       val apiKey = resolveConfiguredApiKeyWithAutoDiscovery()
       if (apiKey == null) {
-        val fallbackUid = "uid_${cleanEmail.hashCode().toUInt()}"
-        val firestoreWritten =
-          syncProfileToFirestore(
-            uid = fallbackUid,
-            idToken = "",
-            name = fullName.trim(),
-            email = cleanEmail,
-            roleBadge = roleBadge,
-            provider = "Email",
-            emailVerified = false,
-          )
-        syncProfileToRealtimeDb(
-          uid = fallbackUid,
-          idToken = "",
-          name = fullName.trim(),
-          email = cleanEmail,
-          roleBadge = roleBadge,
-          provider = "Email",
-          emailVerified = false,
-        )
-        return@withContext Result.success(
-          FirebaseAuthSessionResult(
-            uid = fallbackUid,
-            email = cleanEmail,
-            displayName = fullName.trim(),
-            roleBadge = roleBadge,
-            idToken = "",
-            isCloudSynced = firestoreWritten,
-            isFirestoreSynced = firestoreWritten,
-            isEmailVerified = false,
-            verificationEmailSent = true,
-            statusMessage =
-              "Verification link queued for $cleanEmail! Click the link in your email to verify & enter.",
+        return@withContext Result.failure(
+          IllegalStateException(
+            "FIREBASE_KEY_MISSING: Firebase ($PROJECT_ID) mein account create karne aur verification link bhejne ke liye apna Firebase Web API Key (AIzaSy...) niche paste karein."
           )
         )
       }
@@ -295,7 +274,8 @@ object FirebaseRestAuthClient {
           updateProfileDisplayName(apiKey = apiKey, idToken = idToken, displayName = fullName.trim())
 
           // 2. Immediately dispatch real email verification link via Firebase Auth (`accounts:sendOobCode`)
-          sendEmailVerificationLink(apiKey = apiKey, idToken = idToken)
+          val emailSentResult = sendEmailVerificationLinkWithResult(apiKey = apiKey, idToken = idToken)
+          val emailSentOk = emailSentResult.isSuccess
 
           // 3. Sync user profile to Cloud Firestore (`users/{uid}`) with emailVerified = false
           val firestoreSynced =
@@ -330,9 +310,14 @@ object FirebaseRestAuthClient {
               isCloudSynced = true,
               isFirestoreSynced = firestoreSynced,
               isEmailVerified = false,
-              verificationEmailSent = true,
+              verificationEmailSent = emailSentOk,
               statusMessage =
-                "Verification link sent to $cleanEmail via Firebase ($PROJECT_ID)! Click the link in your email to enter.",
+                if (emailSentOk) {
+                  "Account created in Firebase ($PROJECT_ID) & verification link sent to $cleanEmail!"
+                } else {
+                  emailSentResult.exceptionOrNull()?.message
+                    ?: "Account created in Firebase ($PROJECT_ID). Tap 'Resend Link' to send verification email."
+                },
             )
           )
         }
@@ -467,34 +452,9 @@ object FirebaseRestAuthClient {
 
       val apiKey = resolveConfiguredApiKeyWithAutoDiscovery()
       if (apiKey == null) {
-        val resolvedName =
-          fallbackName.trim().ifBlank {
-            cleanEmail.substringBefore("@").replace(".", " ").replaceFirstChar { it.uppercase() }
-          }
-        val fallbackUid = "uid_${cleanEmail.hashCode().toUInt()}"
-        val (fsName, fsRole) = fetchProfileFromFirestore(uid = fallbackUid, idToken = "")
-        val finalName = fsName ?: resolvedName
-        val finalRole = fsRole ?: fallbackRoleBadge
-        val firestoreWritten =
-          syncProfileToFirestore(
-            uid = fallbackUid,
-            idToken = "",
-            name = finalName,
-            email = cleanEmail,
-            roleBadge = finalRole,
-            provider = "Email",
-          )
-        return@withContext Result.success(
-          FirebaseAuthSessionResult(
-            uid = fallbackUid,
-            email = cleanEmail,
-            displayName = finalName,
-            roleBadge = finalRole,
-            idToken = "",
-            isCloudSynced = firestoreWritten,
-            isFirestoreSynced = firestoreWritten,
-            statusMessage =
-              "Signed in to isolated vault ($PROJECT_ID • UID: ${fallbackUid.takeLast(6)}) ✓",
+        return@withContext Result.failure(
+          IllegalStateException(
+            "FIREBASE_KEY_MISSING: Firebase ($PROJECT_ID) mein sign in karne ke liye apna Firebase Web API Key (AIzaSy...) niche paste karein."
           )
         )
       }
@@ -950,24 +910,29 @@ object FirebaseRestAuthClient {
     withContext(Dispatchers.IO) {
       if (uid.isBlank() || conversation.id.isBlank()) return@withContext
 
-      val messagesJsonArray = JSONArray()
-      for (msg in messages) {
-        if (msg.content.isBlank()) continue
-        messagesJsonArray.put(
-          JSONObject().apply {
-            put("id", msg.id)
-            put("role", msg.role.name)
-            put("content", msg.content)
-            put("timestamp", msg.timestamp)
-            put("status", msg.status.name)
-            put("isLiked", msg.isLiked)
-            put("isBookmarked", msg.isBookmarked)
-            put("attachmentsJson", ChatAttachment.serializeList(msg.attachments))
-            put("citationsJson", WebCitation.serializeList(msg.citations))
+      val serializedMessages =
+        try {
+          val messagesJsonArray = JSONArray()
+          for (msg in messages) {
+            if (msg.content.isBlank()) continue
+            messagesJsonArray.put(
+              JSONObject().apply {
+                put("id", msg.id)
+                put("role", msg.role.name)
+                put("content", msg.content)
+                put("timestamp", msg.timestamp)
+                put("status", msg.status.name)
+                put("isLiked", msg.isLiked)
+                put("isBookmarked", msg.isBookmarked)
+                put("attachmentsJson", ChatAttachment.serializeList(msg.attachments))
+                put("citationsJson", WebCitation.serializeList(msg.citations))
+              }
+            )
           }
-        )
-      }
-      val serializedMessages = messagesJsonArray.toString()
+          messagesJsonArray.toString()
+        } catch (_: Throwable) {
+          return@withContext
+        }
 
       // 1. Sync to Cloud Firestore (`users/{uid}/conversations/{convId}`)
       try {
@@ -1236,7 +1201,13 @@ object FirebaseRestAuthClient {
   }
 
   private fun sendEmailVerificationLink(apiKey: String, idToken: String): Boolean {
-    if (apiKey.isBlank() || idToken.isBlank()) return false
+    return sendEmailVerificationLinkWithResult(apiKey, idToken).isSuccess
+  }
+
+  private fun sendEmailVerificationLinkWithResult(apiKey: String, idToken: String): Result<Unit> {
+    if (apiKey.isBlank() || idToken.isBlank()) {
+      return Result.failure(IllegalStateException("Missing Firebase API key or session token."))
+    }
     return try {
       val payload =
         JSONObject().apply {
@@ -1248,9 +1219,18 @@ object FirebaseRestAuthClient {
           .url("https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=$apiKey")
           .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
           .build()
-      httpClient.newCall(req).execute().use { resp -> resp.isSuccessful }
-    } catch (_: Exception) {
-      false
+      httpClient.newCall(req).execute().use { resp ->
+        val bodyStr = resp.body?.string().orEmpty()
+        if (resp.isSuccessful) {
+          Result.success(Unit)
+        } else {
+          Result.failure(
+            IllegalStateException(parseFirebaseAuthError(bodyStr, isSignUp = false))
+          )
+        }
+      }
+    } catch (e: Exception) {
+      Result.failure(e)
     }
   }
 
@@ -1295,34 +1275,9 @@ object FirebaseRestAuthClient {
       val apiKey = resolveConfiguredApiKeyWithAutoDiscovery()
 
       if (apiKey == null) {
-        // When running without FIREBASE_WEB_API_KEY in Secrets, record verification in Firestore/RTDB
-        val resolvedName =
-          name.trim().ifBlank {
-            cleanEmail.substringBefore("@").replace(".", " ").replaceFirstChar { it.uppercase() }
-          }
-        syncProfileToFirestore(
-          uid = resolvedUid,
-          idToken = idToken,
-          name = resolvedName,
-          email = cleanEmail,
-          roleBadge = roleBadge,
-          provider = "Email",
-          emailVerified = true,
-        )
-        syncProfileToRealtimeDb(
-          uid = resolvedUid,
-          idToken = idToken,
-          name = resolvedName,
-          email = cleanEmail,
-          roleBadge = roleBadge,
-          provider = "Email",
-          emailVerified = true,
-        )
-        return@withContext Result.success(
-          EmailVerificationLookupResult(
-            isVerified = true,
-            refreshedIdToken = idToken,
-            statusMessage = "Email $cleanEmail verified ✓ Entering Astryn AI…",
+        return@withContext Result.failure(
+          IllegalStateException(
+            "FIREBASE_KEY_MISSING: Email verification check karne ke liye apna Firebase Web API Key (AIzaSy...) paste karein."
           )
         )
       }
@@ -1592,11 +1547,21 @@ object FirebaseRestAuthClient {
         return@withContext Result.failure(IllegalArgumentException(check.statusMessage))
       }
       val apiKey = resolveConfiguredApiKeyWithAutoDiscovery()
-      if (apiKey != null && idToken.isNotBlank()) {
-        sendEmailVerificationLink(apiKey = apiKey, idToken = idToken)
-        Result.success("Verification link sent to $cleanEmail via Firebase ($PROJECT_ID) ✓")
+      if (apiKey == null || idToken.isBlank()) {
+        return@withContext Result.failure(
+          IllegalStateException(
+            "FIREBASE_KEY_MISSING: Verification link bhejne ke liye Firebase Web API Key (AIzaSy...) required hai."
+          )
+        )
+      }
+      val sendRes = sendEmailVerificationLinkWithResult(apiKey = apiKey, idToken = idToken)
+      if (sendRes.isSuccess) {
+        Result.success("Verification link sent to $cleanEmail! Check your Inbox or Spam folder.")
       } else {
-        Result.success("Email $cleanEmail is verified in your Astryn Vault ($PROJECT_ID) ✓")
+        Result.failure(
+          sendRes.exceptionOrNull()
+            ?: IllegalStateException("Could not send verification link to $cleanEmail.")
+        )
       }
     }
 

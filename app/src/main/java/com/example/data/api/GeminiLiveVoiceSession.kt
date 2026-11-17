@@ -15,6 +15,7 @@ import android.util.Base64
 import androidx.compose.runtime.Immutable
 import androidx.core.content.ContextCompat
 import com.example.data.local.UserApiKeyManager
+import com.example.data.model.ChatMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -834,6 +835,8 @@ class GeminiLiveVoiceSession(
     fun buildSmartJarvisChatReply(
       userPrompt: String,
       liveVoiceMood: LiveGirlfriendMood? = null,
+      conversationHistory: List<ChatMessage> = emptyList(),
+      userUid: String? = null,
     ): String {
       if (liveVoiceMood != null) {
         return buildOfflineJarvisHindiReply(userPrompt, liveVoiceMood)
@@ -1054,7 +1057,61 @@ class GeminiLiveVoiceSession(
         }.trimEnd()
       }
 
-      // 1. Math & Arithmetic Evaluator
+      // 1. Phase-2 Astryn Intelligence Engine: Intent, Context, Math Verification & Specialized Domains
+      val intentAnalysis =
+        AstrynIntelligenceEngine.analyzeIntentAndContext(
+          prompt = clean,
+          conversationHistory = conversationHistory,
+          userUid = userUid,
+        )
+
+      when (intentAnalysis.primaryIntent) {
+        AstrynIntelligenceEngine.PrimaryIntent.MATH_AND_DISCOUNT_CALCULATION,
+        AstrynIntelligenceEngine.PrimaryIntent.LOW_BUDGET_BUSINESS_OR_CAREER,
+        AstrynIntelligenceEngine.PrimaryIntent.OPTION_EXPANSION_FOLLOWUP,
+        AstrynIntelligenceEngine.PrimaryIntent.AMBIGUOUS_PROBLEM_FOLLOWUP,
+        AstrynIntelligenceEngine.PrimaryIntent.CROSS_CONVERSATION_RECALL,
+        AstrynIntelligenceEngine.PrimaryIntent.CODE_DEBUGGING_AND_FIX,
+        AstrynIntelligenceEngine.PrimaryIntent.CURRENT_INFO_AND_RESEARCH,
+        AstrynIntelligenceEngine.PrimaryIntent.CREATIVE_CONCEPT_GENERATION -> {
+          val raw =
+            AstrynIntelligenceEngine.generateContextualFallbackResponse(
+              prompt = clean,
+              intentResult = intentAnalysis,
+              conversationHistory = conversationHistory,
+              userUid = userUid,
+            )
+          return AstrynIntelligenceEngine.verifyAndRepairResponse(
+            prompt = clean,
+            rawResponse = raw,
+            intentResult = intentAnalysis,
+          ).verifiedContent
+        }
+        AstrynIntelligenceEngine.PrimaryIntent.EDUCATIONAL_CONCEPT_EXPLANATION -> {
+          if (
+            lower.contains("photosynthesis") ||
+              lower.contains("प्रकाश संश्लेषण") ||
+              lower.contains("basic se") ||
+              lower.contains("hindi mein")
+          ) {
+            val raw =
+              AstrynIntelligenceEngine.generateContextualFallbackResponse(
+                prompt = clean,
+                intentResult = intentAnalysis,
+                conversationHistory = conversationHistory,
+                userUid = userUid,
+              )
+            return AstrynIntelligenceEngine.verifyAndRepairResponse(
+              prompt = clean,
+              rawResponse = raw,
+              intentResult = intentAnalysis,
+            ).verifiedContent
+          }
+        }
+        else -> Unit
+      }
+
+      // 1B. Simple Math & Arithmetic Evaluator
       val mathEval = evaluateSimpleMathOrNull(clean)
       if (mathEval != null) {
         return buildString {

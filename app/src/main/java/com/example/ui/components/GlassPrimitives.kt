@@ -146,22 +146,28 @@ fun AmbientGlassBackground(
   val activeStyle = bgStyleOverride ?: prefs.chatBgStyle
   val isMoodReactive = prefs.moodReactiveBg
 
-  // Determine mood-reactive accent palette when enabled
-  val lowerMood = moodHint.lowercase()
-  val isRomanticMood =
-    isMoodReactive &&
-      (prefs.selectedPersona == AiPersona.GIRLFRIEND ||
-        lowerMood.contains("romantic") ||
-        lowerMood.contains("love") ||
-        lowerMood.contains("pyaar") ||
-        lowerMood.contains("aanya") ||
-        lowerMood.contains("zoya"))
-  val isMastiMood =
-    isMoodReactive &&
-      (lowerMood.contains("masti") ||
-        lowerMood.contains("majak") ||
-        lowerMood.contains("roast") ||
-        lowerMood.contains("joke"))
+  // Determine mood-reactive accent palette when enabled (memoized for zero-lag recomposition)
+  val (isRomanticMood, isMastiMood) =
+    remember(moodHint, prefs.selectedPersona, isMoodReactive) {
+      if (!isMoodReactive) {
+        false to false
+      } else {
+        val sample = moodHint.take(160).lowercase()
+        val romantic =
+          prefs.selectedPersona == AiPersona.GIRLFRIEND ||
+            sample.contains("romantic") ||
+            sample.contains("love") ||
+            sample.contains("pyaar") ||
+            sample.contains("aanya") ||
+            sample.contains("zoya")
+        val masti =
+          sample.contains("masti") ||
+            sample.contains("majak") ||
+            sample.contains("roast") ||
+            sample.contains("joke")
+        romantic to masti
+      }
+    }
 
   val targetPrimaryGlowColor =
     when {

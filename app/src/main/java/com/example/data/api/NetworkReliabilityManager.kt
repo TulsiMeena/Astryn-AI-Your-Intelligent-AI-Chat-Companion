@@ -102,9 +102,13 @@ object SafeDiagnosticLogger {
     if (input.isNullOrBlank()) return false
     val withoutRedactedMarkers =
       input
-        .replace("[REDACTED]", "")
-        .replace("[REDACTED_API_KEY]", "")
-        .replace("[REDACTED_TOKEN]", "")
+        .replace(Regex("""x-goog-api-key\s*[:=]\s*\[REDACTED[A-Z_]*\]""", RegexOption.IGNORE_CASE), "")
+        .replace(Regex("""Bearer\s+\[REDACTED[A-Z_]*\]""", RegexOption.IGNORE_CASE), "")
+        .replace(Regex("""[?&](?:key|api_key|token|access_token)=\[REDACTED[A-Z_]*\]""", RegexOption.IGNORE_CASE), "")
+        .replace("[REDACTED]", "SAFE_VAL")
+        .replace("[REDACTED_API_KEY]", "SAFE_VAL")
+        .replace("[REDACTED_TOKEN]", "SAFE_VAL")
+        .replace("[REDACTED_SECRET]", "SAFE_VAL")
     return GOOGLE_API_KEY_REGEX.containsMatchIn(withoutRedactedMarkers) ||
       SK_KEY_REGEX.containsMatchIn(withoutRedactedMarkers) ||
       BEARER_TOKEN_REGEX.containsMatchIn(withoutRedactedMarkers) ||
@@ -127,6 +131,12 @@ object SafeDiagnosticLogger {
 
   fun logWarning(category: AppErrorCategory, diagnosticSummary: String) {
     val safeText = redactSecrets(diagnosticSummary)
+    AstrynDiagnosticsManager.recordEvent(
+      subsystem = AstrynDiagnosticsManager.Subsystem.GEMINI_API,
+      severity = AstrynDiagnosticsManager.Severity.WARNING,
+      operation = category.name,
+      rawMessage = safeText
+    )
     try {
       Log.w(TAG, "[${category.name}] $safeText")
     } catch (_: Throwable) {

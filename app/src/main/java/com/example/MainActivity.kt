@@ -102,17 +102,13 @@ class MainActivity : ComponentActivity() {
     setContent {
       val userPreferences by preferencesRepository.preferencesFlow.collectAsState()
       val isUserAuthenticated =
-        (userPreferences.isLoggedIn && userPreferences.userUid.isNotBlank()) ||
-          userPreferences.hasSkippedAuth
+        userPreferences.isLoggedIn && userPreferences.userUid.isNotBlank()
 
       var currentScreen by
         rememberSaveable(stateSaver = AppScreen.Saver) {
           val initialPrefs = preferencesRepository.preferencesFlow.value
           val startScreen =
-            if (
-              (!initialPrefs.isLoggedIn || initialPrefs.userUid.isBlank()) &&
-                !initialPrefs.hasSkippedAuth
-            ) {
+            if (!initialPrefs.isLoggedIn || initialPrefs.userUid.isBlank()) {
               AppScreen.Auth(initialIsSignUp = false)
             } else {
               AppScreen.Home
@@ -120,21 +116,28 @@ class MainActivity : ComponentActivity() {
           mutableStateOf<AppScreen>(startScreen)
         }
 
+      var lastAuthenticatedUid by rememberSaveable {
+        mutableStateOf(preferencesRepository.preferencesFlow.value.userUid)
+      }
+
+      val createUserScopedConversationId: () -> String = {
+        val uidPrefix = userPreferences.userUid.trim().ifBlank { "user" }
+        "${uidPrefix}_${UUID.randomUUID()}"
+      }
+
       // Bind ChatHistoryRepository strictly to the authenticated user's UID
-      // (or "guest_local_session" in Guest mode) so User B can never see User A's conversations.
+      // so User B can never see User A's conversations.
       LaunchedEffect(
         userPreferences.isLoggedIn,
-        userPreferences.hasSkippedAuth,
         userPreferences.userUid,
         userPreferences.authIdToken,
       ) {
         historyRepository.loadFromStorage()
         val effectiveUid =
-          when {
-            userPreferences.isLoggedIn && userPreferences.userUid.isNotBlank() ->
-              userPreferences.userUid
-            userPreferences.hasSkippedAuth -> "guest_local_session"
-            else -> "__signed_out__"
+          if (userPreferences.isLoggedIn && userPreferences.userUid.isNotBlank()) {
+            userPreferences.userUid
+          } else {
+            "__signed_out__"
           }
         historyRepository.setActiveUser(
           uid = effectiveUid,
@@ -143,6 +146,9 @@ class MainActivity : ComponentActivity() {
         )
         if (!isUserAuthenticated) {
           currentScreen = AppScreen.Auth(initialIsSignUp = false)
+        } else if (lastAuthenticatedUid != userPreferences.userUid) {
+          lastAuthenticatedUid = userPreferences.userUid
+          currentScreen = AppScreen.Home
         }
       }
 
@@ -154,21 +160,21 @@ class MainActivity : ComponentActivity() {
             AstrynGlassWidgetProvider.ACTION_OPEN_LIVE_VOICE -> {
               currentScreen =
                 AppScreen.Chat(
-                  conversationId = UUID.randomUUID().toString(),
+                  conversationId = createUserScopedConversationId(),
                   startLiveVoice = true,
                 )
             }
             AstrynGlassWidgetProvider.ACTION_OPEN_VOICE_MIC -> {
               currentScreen =
                 AppScreen.Chat(
-                  conversationId = UUID.randomUUID().toString(),
+                  conversationId = createUserScopedConversationId(),
                   startVoiceMic = true,
                 )
             }
             AstrynGlassWidgetProvider.ACTION_NEW_CHAT -> {
               currentScreen =
                 AppScreen.Chat(
-                  conversationId = UUID.randomUUID().toString(),
+                  conversationId = createUserScopedConversationId(),
                 )
             }
           }
@@ -223,7 +229,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val startChatWithSession: (String?) -> Unit = { prompt ->
-          val newId = UUID.randomUUID().toString()
+          val newId = createUserScopedConversationId()
           currentScreen = AppScreen.Chat(initialPrompt = prompt, conversationId = newId)
         }
 
@@ -270,7 +276,7 @@ class MainActivity : ComponentActivity() {
                 }
                 val activeId = (currentScreen as? AppScreen.Chat)?.conversationId
                 if (activeId == convId) {
-                  currentScreen = AppScreen.Chat(conversationId = UUID.randomUUID().toString())
+                  currentScreen = AppScreen.Chat(conversationId = createUserScopedConversationId())
                 }
               },
               onTogglePinConversation = { convId ->

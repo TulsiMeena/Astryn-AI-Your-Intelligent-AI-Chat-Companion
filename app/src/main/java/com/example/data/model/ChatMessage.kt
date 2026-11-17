@@ -33,15 +33,23 @@ enum class MessageStatus {
 enum class AttachmentKind {
   IMAGE,
   PDF,
+  DOCX,
+  XLSX,
+  CSV,
+  TXT,
+  MARKDOWN,
+  SOURCE_CODE,
 }
 
 /**
- * Immutable representation of an Image or PDF attachment associated with a chat message.
+ * Immutable representation of an Image, PDF, Document, Spreadsheet, or Code attachment
+ * associated with a chat message.
  *
  * - [inlineBase64Data] holds the Base64-encoded binary payload (downsampled JPEG/PNG/WebP image
  *   or PDF bytes / rendered page images) for multimodal Gemini requests.
- * - [extractedText] holds extracted page-numbered text for PDFs so follow-up questions in the
- *   conversation retain document context without resending large binary payloads on every turn.
+ * - [extractedText] holds extracted page-numbered or structured text for PDFs, DOCX, XLSX, CSV,
+ *   TXT, Markdown, and source-code files so follow-up questions in the conversation retain
+ *   document context without resending large binary payloads on every turn.
  */
 @Immutable
 data class ChatAttachment(
@@ -49,15 +57,20 @@ data class ChatAttachment(
   val fileName: String,
   val mimeType: String,
   val fileSizeBytes: Long,
-  val kind: AttachmentKind =
-    if (mimeType.equals("application/pdf", ignoreCase = true)) AttachmentKind.PDF
-    else AttachmentKind.IMAGE,
+  val kind: AttachmentKind = inferKindFromMimeAndName(mimeType, fileName),
   val pageCount: Int? = null,
   val extractedText: String? = null,
   val inlineBase64Data: String? = null,
   val inlineMimeType: String = mimeType,
   val renderedPageImagesBase64: List<String> = emptyList(),
   val thumbnailBase64: String? = null,
+  val imageWidth: Int? = null,
+  val imageHeight: Int? = null,
+  val analyzedPageCount: Int? = null,
+  val omittedPageCount: Int? = null,
+  val isScannedOrImageBasedPdf: Boolean = false,
+  val documentSummary: String? = null,
+  val pageTextMap: Map<Int, String> = emptyMap(),
 ) {
   /**
    * Human-readable file size label (e.g., "245 KB", "1.4 MB").
@@ -66,13 +79,74 @@ data class ChatAttachment(
     get() = formatBytes(fileSizeBytes)
 
   /**
-   * Builds a concise context representation for multi-turn follow-up questions
-   * so the assistant remembers the attachment details and extracted document text.
+   * Retrieves the extracted text for specific 1-indexed page numbers or section/chapter keywords,
+   * scanning both [pageTextMap] and `[Page X of Y]` blocks inside [extractedText].
    */
-  fun buildFollowUpContextSummary(maxChars: Int = 6_000): String {
+  fun extractTargetedPagesOrSections(
+    targetPageNumbers: List<Int> = emptyList(),
+    targetSectionKeywords: List<String> = emptyList(),
+  ): String {
+    if (kind != AttachmentKind.PDF) return extractedText.orEmpty()
+    val resolvedMap =
+      if (pageTextMap.isNotEmpty()) {
+        pageTextMap
+      } else {
+        parsePageMapFromExtractedText(extractedText.orEmpty())
+      }
+    if (resolvedMap.isEmpty()) return extractedText.orEmpty()
+
+    val matchedPages = LinkedHashMap<Int, String>()
+    for (p in targetPageNumbers) {
+      val text = resolvedMap[p]
+      if (!text.isNullOrBlank()) {
+        matchedPages[p] = text
+      }
+    }
+
+    if (targetSectionKeywords.isNotEmpty()) {
+      for ((pageNum, pageContent) in resolvedMap) {
+        val lowerPage = pageContent.lowercase(java.util.Locale.ROOT)
+        if (targetSectionKeywords.any { kw -> kw.isNotBlank() && lowerPage.contains(kw.lowercase(java.util.Locale.ROOT)) }) {
+          matchedPages[pageNum] = pageContent
+        }
+      }
+    }
+
+    if (matchedPages.isEmpty()) return ""
+    val totalPages = pageCount ?: resolvedMap.keys.maxOrNull() ?: matchedPages.size
+    return buildString {
+      for ((pageNum, pageContent) in matchedPages) {
+        if (isNotEmpty()) append("\n\n")
+        append("[Targeted Page $pageNum of $totalPages]\n")
+        append(pageContent.trim())
+      }
+    }
+  }
+
+  /**
+   * Builds a rich context representation for multi-turn follow-up questions
+   * so the assistant remembers the attachment details, document-level summary,
+   * targeted pages/chapters, and any omitted-page disclosures.
+   */
+  fun buildFollowUpContextSummary(
+    maxChars: Int = 6_000,
+    targetPageNumbers: List<Int> = emptyList(),
+    targetSectionKeywords: List<String> = emptyList(),
+  ): String {
     return buildString {
       append("[Attached ")
-      append(if (kind == AttachmentKind.PDF) "PDF Document" else "Image")
+      append(
+        when (kind) {
+          AttachmentKind.PDF -> "PDF Document"
+          AttachmentKind.DOCX -> "DOCX Document"
+          AttachmentKind.XLSX -> "XLSX Spreadsheet"
+          AttachmentKind.CSV -> "CSV Dataset"
+          AttachmentKind.TXT -> "Text Document"
+          AttachmentKind.MARKDOWN -> "Markdown Document"
+          AttachmentKind.SOURCE_CODE -> "Source Code File"
+          AttachmentKind.IMAGE -> "Image"
+        }
+      )
       append(": ")
       append(fileName)
       append(" (")
@@ -81,18 +155,59 @@ data class ChatAttachment(
         append(", ")
         append(pageCount)
         append(if (pageCount == 1) " page" else " pages")
+        if (analyzedPageCount != null && analyzedPageCount > 0 && analyzedPageCount < pageCount) {
+          append(", analyzed pages 1–$analyzedPageCount")
+        }
+      }
+      if (imageWidth != null && imageHeight != null && imageWidth > 0 && imageHeight > 0) {
+        append(", ${imageWidth}x${imageHeight}px")
+      }
+      if (isScannedOrImageBasedPdf) {
+        append(", scanned/visual PDF")
       }
       append(")]")
-      if (!extractedText.isNullOrBlank()) {
+
+      if (!documentSummary.isNullOrBlank()) {
+        append("\n[Document Overview: ")
+        append(documentSummary.trim())
+        append("]")
+      }
+
+      if (omittedPageCount != null && omittedPageCount > 0 && pageCount != null) {
+        val startOmitted = (pageCount - omittedPageCount + 1).coerceAtLeast(1)
+        append(
+          "\n[Disclosure: Pages $startOmitted–$pageCount ($omittedPageCount pages) were beyond the extraction limit and are unavailable unless uploaded separately.]"
+        )
+      }
+
+      val targetedBlock =
+        if (targetPageNumbers.isNotEmpty() || targetSectionKeywords.isNotEmpty()) {
+          extractTargetedPagesOrSections(targetPageNumbers, targetSectionKeywords)
+        } else {
+          ""
+        }
+
+      if (!extractedText.isNullOrBlank() || targetedBlock.isNotBlank()) {
         append("\n<untrusted_document_content file=\"")
         append(fileName.replace("\"", "'"))
         append("\">\n")
-        val trimmed = extractedText.trim()
-        if (trimmed.length <= maxChars) {
-          append(trimmed)
+        if (targetedBlock.isNotBlank()) {
+          append(targetedBlock.take(maxChars))
+          val remainingBudget = (maxChars - targetedBlock.length - 120).coerceAtLeast(0)
+          if (remainingBudget > 300 && !extractedText.isNullOrBlank()) {
+            append("\n\n--- Additional Document Context ---\n")
+            append(extractedText.trim().take(remainingBudget))
+          }
         } else {
-          append(trimmed.take(maxChars))
-          append("\n...[Document text truncated to fit context window]...")
+          val trimmed = extractedText.orEmpty().trim()
+          if (trimmed.length <= maxChars) {
+            append(trimmed)
+          } else {
+            append(trimmed.take(maxChars))
+            append(
+              "\n...[Document text truncated at $maxChars chars to fit context window; ask for a specific page number to inspect further pages]..."
+            )
+          }
         }
         append("\n</untrusted_document_content>")
       }
@@ -107,10 +222,16 @@ data class ChatAttachment(
       put("fileSizeBytes", fileSizeBytes)
       put("kind", kind.name)
       if (pageCount != null) put("pageCount", pageCount)
-      // Persist extracted text (up to 12 KB) and compact thumbnail so follow-up questions
+      if (imageWidth != null) put("imageWidth", imageWidth)
+      if (imageHeight != null) put("imageHeight", imageHeight)
+      if (analyzedPageCount != null) put("analyzedPageCount", analyzedPageCount)
+      if (omittedPageCount != null) put("omittedPageCount", omittedPageCount)
+      if (isScannedOrImageBasedPdf) put("isScannedOrImageBasedPdf", true)
+      if (!documentSummary.isNullOrBlank()) put("documentSummary", documentSummary.take(2_000))
+      // Persist extracted text (up to 24 KB) and compact thumbnail so follow-up questions
       // and message bubbles work across app restarts without bloating SQLite rows.
       if (!extractedText.isNullOrBlank()) {
-        put("extractedText", extractedText.take(12_000))
+        put("extractedText", extractedText.take(24_000))
       }
       if (!thumbnailBase64.isNullOrBlank() && thumbnailBase64.length <= 64_000) {
         put("thumbnailBase64", thumbnailBase64)
@@ -119,6 +240,41 @@ data class ChatAttachment(
   }
 
   companion object {
+    fun inferKindFromMimeAndName(mimeType: String, fileName: String): AttachmentKind {
+      val cleanMime = mimeType.lowercase(java.util.Locale.ROOT).trim()
+      val lowerName = fileName.lowercase(java.util.Locale.ROOT).trim()
+      return when {
+        cleanMime == "application/pdf" || lowerName.endsWith(".pdf") -> AttachmentKind.PDF
+        cleanMime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+          lowerName.endsWith(".docx") -> AttachmentKind.DOCX
+        cleanMime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+          lowerName.endsWith(".xlsx") -> AttachmentKind.XLSX
+        cleanMime == "text/csv" || cleanMime == "application/csv" || lowerName.endsWith(".csv") ->
+          AttachmentKind.CSV
+        cleanMime == "text/markdown" || lowerName.endsWith(".md") || lowerName.endsWith(".markdown") ->
+          AttachmentKind.MARKDOWN
+        lowerName.endsWith(".kt") ||
+          lowerName.endsWith(".kts") ||
+          lowerName.endsWith(".java") ||
+          lowerName.endsWith(".py") ||
+          lowerName.endsWith(".js") ||
+          lowerName.endsWith(".ts") ||
+          lowerName.endsWith(".tsx") ||
+          lowerName.endsWith(".jsx") ||
+          lowerName.endsWith(".html") ||
+          lowerName.endsWith(".css") ||
+          lowerName.endsWith(".sql") ||
+          lowerName.endsWith(".c") ||
+          lowerName.endsWith(".cpp") ||
+          lowerName.endsWith(".h") ||
+          lowerName.endsWith(".hpp") ||
+          lowerName.endsWith(".json") ||
+          lowerName.endsWith(".xml") -> AttachmentKind.SOURCE_CODE
+        cleanMime == "text/plain" || lowerName.endsWith(".txt") -> AttachmentKind.TXT
+        else -> AttachmentKind.IMAGE
+      }
+    }
+
     fun formatBytes(bytes: Long): String {
       if (bytes <= 0L) return "0 B"
       if (bytes < 1024L) return "$bytes B"
@@ -128,6 +284,28 @@ data class ChatAttachment(
       return String.format(java.util.Locale.US, "%.2f MB", mb)
     }
 
+    fun parsePageMapFromExtractedText(rawText: String): Map<Int, String> {
+      if (rawText.isBlank()) return emptyMap()
+      val map = LinkedHashMap<Int, String>()
+      val pageHeaderRegex = Regex("""\[Page\s+(\d+)\s+of\s+\d+\]\r?\n""")
+      val matches = pageHeaderRegex.findAll(rawText).toList()
+      if (matches.isEmpty()) return emptyMap()
+      for (i in matches.indices) {
+        val pageNum = matches[i].groupValues[1].toIntOrNull() ?: continue
+        val start = matches[i].range.last + 1
+        val end =
+          if (i + 1 < matches.size) matches[i + 1].range.first
+          else rawText.length
+        if (start < end) {
+          val slice = rawText.substring(start, end).trim()
+          if (slice.isNotEmpty()) {
+            map[pageNum] = slice
+          }
+        }
+      }
+      return map
+    }
+
     fun fromPersistedJsonObject(obj: JSONObject): ChatAttachment? {
       val fileName = obj.optString("fileName", "").trim()
       val mimeType = obj.optString("mimeType", "").trim()
@@ -135,11 +313,24 @@ data class ChatAttachment(
       val kindStr = obj.optString("kind", "")
       val kind =
         AttachmentKind.entries.firstOrNull { it.name.equals(kindStr, ignoreCase = true) }
-          ?: if (mimeType.equals("application/pdf", ignoreCase = true)) AttachmentKind.PDF
-          else AttachmentKind.IMAGE
+          ?: inferKindFromMimeAndName(mimeType, fileName)
       val pageCount = if (obj.has("pageCount")) obj.optInt("pageCount", 0).takeIf { it > 0 } else null
+      val imageWidth = if (obj.has("imageWidth")) obj.optInt("imageWidth", 0).takeIf { it > 0 } else null
+      val imageHeight = if (obj.has("imageHeight")) obj.optInt("imageHeight", 0).takeIf { it > 0 } else null
+      val analyzedPageCount =
+        if (obj.has("analyzedPageCount")) obj.optInt("analyzedPageCount", 0).takeIf { it > 0 } else null
+      val omittedPageCount =
+        if (obj.has("omittedPageCount")) obj.optInt("omittedPageCount", 0).takeIf { it > 0 } else null
+      val isScanned = obj.optBoolean("isScannedOrImageBasedPdf", false)
+      val docSummary = obj.optString("documentSummary", "").ifBlank { null }
       val extractedText = obj.optString("extractedText", "").ifBlank { null }
       val thumb = obj.optString("thumbnailBase64", "").ifBlank { null }
+      val reconstructedMap =
+        if (kind == AttachmentKind.PDF && !extractedText.isNullOrBlank()) {
+          parsePageMapFromExtractedText(extractedText)
+        } else {
+          emptyMap()
+        }
       return ChatAttachment(
         id = obj.optString("id", UUID.randomUUID().toString()).ifBlank { UUID.randomUUID().toString() },
         fileName = fileName,
@@ -149,6 +340,13 @@ data class ChatAttachment(
         pageCount = pageCount,
         extractedText = extractedText,
         thumbnailBase64 = thumb,
+        imageWidth = imageWidth,
+        imageHeight = imageHeight,
+        analyzedPageCount = analyzedPageCount,
+        omittedPageCount = omittedPageCount,
+        isScannedOrImageBasedPdf = isScanned,
+        documentSummary = docSummary,
+        pageTextMap = reconstructedMap,
       )
     }
 

@@ -69,16 +69,29 @@ class ChatHistoryRepository(
     if (uid.isBlank()) return true
     if (uid == "__signed_out__") return false
     val owner = conversationOwners[conversationId]
-    return owner == uid || conversationId.startsWith("${uid}_")
+    if (owner != null) {
+      return owner == uid
+    }
+    if (conversationId.startsWith("${uid}_")) {
+      conversationOwners[conversationId] = uid
+      try {
+        ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.apply()
+      } catch (_: Exception) {}
+      return true
+    }
+    return false
   }
 
   private fun bindConversationToActiveUser(conversationId: String) {
     val uid = activeUserUid
     if (uid.isNotBlank() && uid != "__signed_out__") {
-      conversationOwners[conversationId] = uid
-      try {
-        ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.apply()
-      } catch (_: Exception) {}
+      val existingOwner = conversationOwners[conversationId]
+      if (existingOwner == null || existingOwner == uid) {
+        conversationOwners[conversationId] = uid
+        try {
+          ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.apply()
+        } catch (_: Exception) {}
+      }
     }
   }
 
@@ -376,11 +389,23 @@ class ChatHistoryRepository(
           if (existingIndex >= 0) {
             list[existingIndex] = safeMessage
           } else {
-            // Fast path: if timestamp is >= last message, append without full O(M log M) sort
-            val lastTs = list.lastOrNull()?.timestamp ?: Long.MIN_VALUE
-            list.add(safeMessage)
-            if (safeMessage.timestamp < lastTs) {
-              list.sortBy { it.timestamp }
+            // Prevent accidental duplicate user message insertion on immediate retry
+            val tail = list.lastOrNull()
+            if (
+              tail != null &&
+                tail.role == MessageRole.USER &&
+                safeMessage.role == MessageRole.USER &&
+                tail.content.trim() == safeMessage.content.trim() &&
+                kotlin.math.abs(safeMessage.timestamp - tail.timestamp) < 1_500L
+            ) {
+              list[list.lastIndex] = safeMessage.copy(id = tail.id)
+            } else {
+              // Fast path: if timestamp is >= last message, append without full O(M log M) sort
+              val lastTs = list.lastOrNull()?.timestamp ?: Long.MIN_VALUE
+              list.add(safeMessage)
+              if (safeMessage.timestamp < lastTs) {
+                list.sortBy { it.timestamp }
+              }
             }
           }
         }
@@ -468,9 +493,21 @@ class ChatHistoryRepository(
           )
         }
 
+        com.example.data.api.AstrynDiagnosticsManager.recordEvent(
+          subsystem = com.example.data.api.AstrynDiagnosticsManager.Subsystem.DATABASE_SYNC,
+          severity = com.example.data.api.AstrynDiagnosticsManager.Severity.INFO,
+          operation = "saveMessage",
+          rawMessage = "Message persisted successfully"
+        )
         _storageErrorFlow.value = null
         Result.success(Unit)
       } catch (e: Exception) {
+        com.example.data.api.AstrynDiagnosticsManager.recordEvent(
+          subsystem = com.example.data.api.AstrynDiagnosticsManager.Subsystem.DATABASE_SYNC,
+          severity = com.example.data.api.AstrynDiagnosticsManager.Severity.ERROR,
+          operation = "saveMessage",
+          rawMessage = e.message ?: "Failed to save message"
+        )
         _storageErrorFlow.value = "Failed to save message to local storage."
         Result.failure(e)
       }
@@ -482,13 +519,17 @@ class ChatHistoryRepository(
   suspend fun getMessagesForConversation(conversationId: String): List<ChatMessage> =
     withContext(ioDispatcher) {
       if (conversationId.isBlank()) return@withContext emptyList()
-      val existingOwner = conversationOwners[conversationId]
-      if (
-        activeUserUid.isNotBlank() &&
-          (activeUserUid == "__signed_out__" ||
-            (existingOwner != null && existingOwner != activeUserUid))
-      ) {
-        return@withContext emptyList()
+      if (activeUserUid.isNotBlank()) {
+        if (activeUserUid == "__signed_out__") {
+          return@withContext emptyList()
+        }
+        val existingOwner = conversationOwners[conversationId]
+        if (existingOwner != null && existingOwner != activeUserUid) {
+          return@withContext emptyList()
+        }
+        if (conversationsMap.containsKey(conversationId) && !isOwnedByActiveUser(conversationId)) {
+          return@withContext emptyList()
+        }
       }
 
       val cached = messagesByConversation[conversationId]
@@ -526,6 +567,11 @@ class ChatHistoryRepository(
     withContext(ioDispatcher) {
       if (conversationId.isBlank()) {
         return@withContext Result.failure(IllegalArgumentException("Conversation ID is blank."))
+      }
+      if (!isOwnedByActiveUser(conversationId)) {
+        return@withContext Result.failure(
+          IllegalStateException("Security Policy: Cannot modify another user's conversation.")
+        )
       }
       try {
         val currentList = messagesByConversation.getOrPut(conversationId) { mutableListOf() }
@@ -575,9 +621,10 @@ class ChatHistoryRepository(
     }
 
   /**
-   * Returns the current title of a saved conversation, or null if not yet saved.
+   * Returns the current title of a saved conversation, or null if not yet saved or not owned by the active user.
    */
   fun getConversationTitle(conversationId: String): String? {
+    if (!isOwnedByActiveUser(conversationId)) return null
     return conversationsMap[conversationId]?.title
   }
 
@@ -593,6 +640,11 @@ class ChatHistoryRepository(
       if (sanitized.isBlank()) {
         return@withContext Result.failure(
           IllegalArgumentException("Conversation title cannot be empty.")
+        )
+      }
+      if (!isOwnedByActiveUser(conversationId)) {
+        return@withContext Result.failure(
+          IllegalStateException("Security Policy: Cannot rename another user's conversation.")
         )
       }
 
@@ -628,6 +680,11 @@ class ChatHistoryRepository(
     withContext(ioDispatcher) {
       if (conversationId.isBlank()) {
         return@withContext Result.failure(IllegalArgumentException("Invalid conversation ID."))
+      }
+      if (conversationsMap.containsKey(conversationId) && !isOwnedByActiveUser(conversationId)) {
+        return@withContext Result.failure(
+          IllegalStateException("Security Policy: Cannot delete another user's conversation.")
+        )
       }
 
       try {
@@ -724,6 +781,11 @@ class ChatHistoryRepository(
    */
   suspend fun togglePinConversation(conversationId: String): Result<Boolean> =
     withContext(ioDispatcher) {
+      if (!isOwnedByActiveUser(conversationId)) {
+        return@withContext Result.failure(
+          IllegalStateException("Security Policy: Cannot pin another user's conversation.")
+        )
+      }
       val existing =
         conversationsMap[conversationId]
           ?: return@withContext Result.failure(IllegalStateException("Conversation not found."))
@@ -751,6 +813,11 @@ class ChatHistoryRepository(
    */
   suspend fun toggleLikeConversation(conversationId: String): Result<Boolean> =
     withContext(ioDispatcher) {
+      if (!isOwnedByActiveUser(conversationId)) {
+        return@withContext Result.failure(
+          IllegalStateException("Security Policy: Cannot modify another user's conversation.")
+        )
+      }
       val existing =
         conversationsMap[conversationId]
           ?: return@withContext Result.failure(IllegalStateException("Conversation not found."))
@@ -783,6 +850,11 @@ class ChatHistoryRepository(
     withContext(ioDispatcher) {
       if (conversationId.isBlank() || messageId.isBlank()) {
         return@withContext Result.failure(IllegalArgumentException("Invalid ID."))
+      }
+      if (!isOwnedByActiveUser(conversationId)) {
+        return@withContext Result.failure(
+          IllegalStateException("Security Policy: Cannot modify another user's message.")
+        )
       }
       try {
         val list = messagesByConversation[conversationId]
@@ -823,6 +895,11 @@ class ChatHistoryRepository(
       if (conversationId.isBlank() || messageId.isBlank()) {
         return@withContext Result.failure(IllegalArgumentException("Invalid ID."))
       }
+      if (!isOwnedByActiveUser(conversationId)) {
+        return@withContext Result.failure(
+          IllegalStateException("Security Policy: Cannot modify another user's message.")
+        )
+      }
       try {
         val list = messagesByConversation[conversationId]
         var nextBookmarkedState = false
@@ -859,6 +936,9 @@ class ChatHistoryRepository(
    */
   suspend fun formatConversationForExport(conversationId: String): String =
     withContext(ioDispatcher) {
+      if (!isOwnedByActiveUser(conversationId)) {
+        return@withContext ""
+      }
       val conv = conversationsMap[conversationId]
       val title = conv?.title?.ifBlank { "Astryn AI Conversation" } ?: "Astryn AI Conversation"
       val messages = getMessagesForConversation(conversationId)

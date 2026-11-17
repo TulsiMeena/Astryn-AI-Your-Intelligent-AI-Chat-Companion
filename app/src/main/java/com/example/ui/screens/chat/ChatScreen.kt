@@ -130,8 +130,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -719,6 +721,15 @@ fun ChatScreen(
   val glass = AppThemeTokens.glass
   val reducedMotion = LocalReducedMotion.current
   val context = LocalContext.current
+  val haptics = LocalHapticFeedback.current
+  val triggerLightHaptic: () -> Unit =
+    remember(haptics) {
+      {
+        runCatching {
+          haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        }
+      }
+    }
   val coroutineScope = rememberCoroutineScope()
   val uiState by viewModel.uiState.collectAsState()
   val listState = rememberLazyListState()
@@ -1142,12 +1153,13 @@ fun ChatScreen(
     }
   }
 
-  // Smart auto-scroll: only scroll when user is near the bottom (never yank away from reading history)
+  // Smart auto-scroll: only scroll when user is near the bottom and NOT actively dragging the list
   val lastMessageId = uiState.messages.lastOrNull()?.id
   val lastMessageLength = uiState.messages.lastOrNull()?.content?.length ?: 0
 
-  LaunchedEffect(uiState.messages.size, lastMessageId, lastMessageLength) {
-    if (uiState.messages.isNotEmpty() && isNearBottom) {
+  // 1) When a new message bubble is added, smoothly scroll to the latest item
+  LaunchedEffect(uiState.messages.size, lastMessageId) {
+    if (uiState.messages.isNotEmpty() && isNearBottom && !listState.isScrollInProgress) {
       val targetIndex = uiState.messages.lastIndex
       if (reducedMotion || uiState.isGenerating) {
         listState.scrollToItem(targetIndex)
@@ -1157,7 +1169,22 @@ fun ChatScreen(
     }
   }
 
+  // 2) While tokens are streaming, anchor to the bottom edge of the growing message at 60fps-friendly cadence
+  LaunchedEffect(lastMessageLength, uiState.isGenerating) {
+    if (
+      uiState.isGenerating &&
+        lastMessageLength > 0 &&
+        uiState.messages.isNotEmpty() &&
+        isNearBottom &&
+        !listState.isScrollInProgress
+    ) {
+      val targetIndex = uiState.messages.lastIndex
+      listState.scrollToItem(targetIndex, scrollOffset = 100_000)
+    }
+  }
+
   val handleCopyText: (String, String) -> Unit = { label, text ->
+    triggerLightHaptic()
     val ok = copyTextToSystemClipboard(context, label, text)
     if (ok) {
       viewModel.showActionFeedback("$label copied to clipboard")
@@ -1167,6 +1194,7 @@ fun ChatScreen(
   }
 
   val handleShareMessage: (ChatMessage) -> Unit = { message ->
+    triggerLightHaptic()
     val formatted = message.formatForCopyOrShare()
     val shared = shareTextViaAndroidSheet(context, "Astryn AI Response", formatted)
     if (shared) {
@@ -1193,9 +1221,10 @@ fun ChatScreen(
       }
     }
 
+  // Compute mood hint only when message count or persona changes (never on keystroke or streaming token)
   val latestMoodHint =
-    remember(uiState.messages, uiState.inputText) {
-      uiState.inputText.ifBlank { uiState.messages.lastOrNull()?.content.orEmpty() }
+    remember(uiState.messages.size, uiState.selectedPersona) {
+      uiState.messages.lastOrNull()?.content?.take(160).orEmpty()
     }
 
   AmbientGlassBackground(
@@ -1708,12 +1737,15 @@ fun ChatScreen(
                     handleShareMessage(message)
                   },
                   onToggleLike = {
+                    triggerLightHaptic()
                     viewModel.toggleMessageLike(message.id)
                   },
                   onToggleBookmark = {
+                    triggerLightHaptic()
                     viewModel.toggleMessageBookmark(message.id)
                   },
                   onToggleSpeak = {
+                    triggerLightHaptic()
                     val started = speechController.toggleSpeak(message)
                     if (started) {
                       viewModel.showActionFeedback(
@@ -1731,6 +1763,7 @@ fun ChatScreen(
                     )
                   },
                   onModifyResponse = { mode ->
+                    triggerLightHaptic()
                     viewModel.modifyAssistantMessage(message.id, mode)
                   },
                   onCompareResponse = {
@@ -1876,6 +1909,7 @@ fun ChatScreen(
           onRemoveAttachment = viewModel::removePendingAttachment,
           onToggleVoiceInput = handleToggleVoiceInput,
           onSendMessage = {
+            triggerLightHaptic()
             if (isListeningVoice) {
               handleToggleVoiceInput()
             }
@@ -1895,7 +1929,10 @@ fun ChatScreen(
               viewModel.sendMessage()
             }
           },
-          onStopGeneration = viewModel::stopGeneration,
+          onStopGeneration = {
+            triggerLightHaptic()
+            viewModel.stopGeneration()
+          },
         )
       }
     }
@@ -3909,6 +3946,7 @@ private fun ChatMessageItem(
                   textColorOverride = userTextColor,
                   onDownloadCode = onDownloadCode,
                   onRunCode = onRunCode,
+                  isStreaming = message.status == MessageStatus.STREAMING,
                 )
               }
               responseViewMode == AiResponseViewMode.QUICK_SUMMARY ||
