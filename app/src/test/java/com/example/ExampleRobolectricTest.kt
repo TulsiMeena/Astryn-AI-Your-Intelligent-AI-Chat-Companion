@@ -2724,9 +2724,12 @@ class ExampleRobolectricTest {
       composeTestRule.waitForIdle()
       composeTestRule
         .onNodeWithTag("chat_live_voice_stop_button")
-        .performScrollTo()
+        .assertExists()
+      composeTestRule
+        .onNodeWithTag("live_voice_close_header_button")
         .performClick()
       composeTestRule.waitForIdle()
+      composeTestRule.onNodeWithTag("chat_live_voice_fullscreen").assertDoesNotExist()
 
       // Feature 6: Test Sidebar Category Filter Logic (All, Pinned, Liked, Coding, Study, Work)
       val codingConv =

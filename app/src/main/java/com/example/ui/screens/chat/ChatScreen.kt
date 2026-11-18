@@ -341,6 +341,17 @@ class AstrynSpeechController(
             }
           } else if (preferGoogleEngine) {
             initTtsEngine(preferGoogleEngine = false)
+          } else {
+            isEngineReady = false
+            mainHandler.post {
+              pendingUtterance = null
+              pendingGirlfriendUtterance = null
+              activeMessageId = null
+              onSpeakingMessageChanged(null)
+              val cb = utteranceCompletionCallback
+              utteranceCompletionCallback = null
+              cb?.invoke()
+            }
           }
         }
 
@@ -355,6 +366,15 @@ class AstrynSpeechController(
         initTtsEngine(preferGoogleEngine = false)
       } else {
         isEngineReady = false
+        mainHandler.post {
+          pendingUtterance = null
+          pendingGirlfriendUtterance = null
+          activeMessageId = null
+          onSpeakingMessageChanged(null)
+          val cb = utteranceCompletionCallback
+          utteranceCompletionCallback = null
+          cb?.invoke()
+        }
       }
     }
   }
@@ -536,8 +556,34 @@ class AstrynSpeechController(
       speakGirlfriendInternal(utteranceId, cleanSpeech, mood)
     } else {
       pendingGirlfriendUtterance = Triple(utteranceId, cleanSpeech, mood)
+      // Watchdog: if TTS engine never completes initialization on device, don't stay stuck speaking
+      mainHandler.postDelayed(
+        {
+          if (!isEngineReady && activeMessageId == utteranceId) {
+            pendingGirlfriendUtterance = null
+            activeMessageId = null
+            onSpeakingMessageChanged(null)
+            val cb = utteranceCompletionCallback
+            utteranceCompletionCallback = null
+            cb?.invoke()
+          }
+        },
+        2500L,
+      )
     }
     return true
+  }
+
+  private fun clearSpeakingAfterFailure(utteranceId: String) {
+    mainHandler.post {
+      if (activeMessageId == utteranceId) {
+        activeMessageId = null
+        onSpeakingMessageChanged(null)
+        val cb = utteranceCompletionCallback
+        utteranceCompletionCallback = null
+        cb?.invoke()
+      }
+    }
   }
 
   private fun speakGirlfriendInternal(
@@ -546,7 +592,11 @@ class AstrynSpeechController(
     mood: LiveGirlfriendMood,
   ) {
     try {
-      val engine = tts ?: return
+      val engine = tts
+      if (engine == null) {
+        clearSpeakingAfterFailure(utteranceId)
+        return
+      }
       ensureMediaStreamAudible()
 
       val targetPitch =
@@ -592,9 +642,15 @@ class AstrynSpeechController(
         engine.language = Locale.forLanguageTag("en-IN")
         engine.setPitch(targetPitch)
         engine.setSpeechRate(targetRate)
-        engine.speak(fallbackText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        val retryRes =
+          engine.speak(fallbackText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        if (retryRes == TextToSpeech.ERROR) {
+          clearSpeakingAfterFailure(utteranceId)
+        }
       }
-    } catch (_: Exception) {}
+    } catch (_: Exception) {
+      clearSpeakingAfterFailure(utteranceId)
+    }
   }
 
   private fun speakInternal(messageId: String, speechText: String) {
@@ -768,6 +824,8 @@ fun ChatScreen(
   var liveSessionOpenedAt by rememberSaveable { mutableStateOf(0L) }
   var lastLiveUserSpokenText by rememberSaveable { mutableStateOf("") }
   var lastAutoSpokenMessageId by rememberSaveable { mutableStateOf<String?>(null) }
+  var liveVoiceFeedbackMessage by remember { mutableStateOf<String?>(null) }
+  var liveAutoListenTrigger by remember { mutableIntStateOf(0) }
   var speakingMessageId by remember { mutableStateOf<String?>(null) }
   var isNativeLiveAudioPlaying by remember { mutableStateOf(false) }
   var speechRate by remember { mutableStateOf(1.0f) }
@@ -871,6 +929,7 @@ fun ChatScreen(
       contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
       isListeningVoice = false
+      liveVoiceFeedbackMessage = null
       if (result.resultCode == Activity.RESULT_OK) {
         val matches =
           result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
@@ -887,18 +946,23 @@ fun ChatScreen(
       }
     }
 
-  val launchVoiceRecognitionSession: () -> Unit = {
+  lateinit var startSpeechRecognizerWithLocale: (Boolean) -> Unit
+  startSpeechRecognizerWithLocale = { useEnglishFallback ->
+    liveVoiceFeedbackMessage = null
     voicePrefixDraft = uiState.inputText
+    val langTag = if (useEnglishFallback) "en-IN" else "hi-IN"
     val recognizeIntent =
       Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(
           RecognizerIntent.EXTRA_LANGUAGE_MODEL,
           RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
         )
-        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE, langTag)
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, langTag)
+        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1600L)
         putExtra(
           RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
           1200L,
@@ -917,6 +981,7 @@ fun ChatScreen(
           object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
               isListeningVoice = true
+              liveVoiceFeedbackMessage = null
             }
 
             override fun onBeginningOfSpeech() {
@@ -934,6 +999,13 @@ fun ChatScreen(
 
             override fun onError(error: Int) {
               isListeningVoice = false
+              try {
+                recognizer.destroy()
+              } catch (_: Exception) {}
+              if (activeSpeechRecognizer === recognizer) {
+                activeSpeechRecognizer = null
+              }
+
               val fallbackSpoken = latestPartialSpeech.trim()
               if (!hasDispatchedSpeechTurn && fallbackSpoken.isNotBlank()) {
                 hasDispatchedSpeechTurn = true
@@ -943,13 +1015,46 @@ fun ChatScreen(
                 } else {
                   viewModel.appendVoiceTranscript(fallbackSpoken, voicePrefixDraft)
                 }
+                return
               }
-              try {
-                recognizer.destroy()
-              } catch (_: Exception) {}
-              if (activeSpeechRecognizer === recognizer) {
-                activeSpeechRecognizer = null
+
+              // Retry once in en-IN if device lacks hi-IN language pack
+              if (!useEnglishFallback && (error == 12 || error == 13)) {
+                startSpeechRecognizerWithLocale(true)
+                return
               }
+
+              // Fallback to system Speech Intent dialog if inline recognizer cannot bind cleanly
+              if (
+                error == SpeechRecognizer.ERROR_CLIENT ||
+                  error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+              ) {
+                try {
+                  isListeningVoice = true
+                  voiceIntentLauncher.launch(recognizeIntent)
+                  return
+                } catch (_: Exception) {}
+              }
+
+              val userHint =
+                when (error) {
+                  SpeechRecognizer.ERROR_NO_MATCH,
+                  SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
+                    "Aawaz clear nahi aayi — Mic dabakar dobara bolo"
+                  SpeechRecognizer.ERROR_NETWORK,
+                  SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
+                  SpeechRecognizer.ERROR_SERVER ->
+                    "Voice network error — internet check karke dobara try karo"
+                  SpeechRecognizer.ERROR_AUDIO ->
+                    "Mic audio busy hai — dobara Mic dabao"
+                  SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
+                    "Microphone permission allow karo"
+                  else -> "Voice capture nahi ho paya — Mic dabakar dobara bolo"
+                }
+              if (isLiveVoiceMode) {
+                liveVoiceFeedbackMessage = userHint
+              }
+              viewModel.showActionFeedback(userHint)
             }
 
             override fun onResults(results: Bundle?) {
@@ -961,6 +1066,7 @@ fun ChatScreen(
                   ?: latestPartialSpeech.trim().takeIf { it.isNotBlank() }
               if (!hasDispatchedSpeechTurn && !best.isNullOrBlank()) {
                 hasDispatchedSpeechTurn = true
+                liveVoiceFeedbackMessage = null
                 if (isLiveVoiceMode) {
                   lastLiveUserSpokenText = best
                   viewModel.sendMessage(best, liveVoiceMood = liveGirlfriendMood)
@@ -968,6 +1074,12 @@ fun ChatScreen(
                   viewModel.appendVoiceTranscript(best, voicePrefixDraft)
                   viewModel.showActionFeedback("Voice input captured")
                 }
+              } else if (!hasDispatchedSpeechTurn) {
+                val hint = "Aawaz sunai nahi di — Mic dabakar dobara bolo"
+                if (isLiveVoiceMode) {
+                  liveVoiceFeedbackMessage = hint
+                }
+                viewModel.showActionFeedback(hint)
               }
               try {
                 recognizer.destroy()
@@ -1004,7 +1116,9 @@ fun ChatScreen(
           voiceIntentLauncher.launch(recognizeIntent)
         } catch (_: Exception) {
           isListeningVoice = false
-          viewModel.showActionFeedback("Voice input is not supported on this device")
+          val msg = "Voice input is not supported on this device"
+          if (isLiveVoiceMode) liveVoiceFeedbackMessage = msg
+          viewModel.showActionFeedback(msg)
         }
       }
     } else {
@@ -1013,9 +1127,15 @@ fun ChatScreen(
         voiceIntentLauncher.launch(recognizeIntent)
       } catch (_: Exception) {
         isListeningVoice = false
-        viewModel.showActionFeedback("Voice input is not available on this device")
+        val msg = "Voice input is not available on this device"
+        if (isLiveVoiceMode) liveVoiceFeedbackMessage = msg
+        viewModel.showActionFeedback(msg)
       }
     }
+  }
+
+  val launchVoiceRecognitionSession: () -> Unit = {
+    startSpeechRecognizerWithLocale(false)
   }
 
   val audioPermissionLauncher =
@@ -1081,12 +1201,7 @@ fun ChatScreen(
           mood = liveGirlfriendMood,
           onFinished = {
             if (isLiveVoiceMode && liveAutoHandsFree && !isListeningVoice && !uiState.isGenerating) {
-              val hasAudioPerm =
-                ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                  PackageManager.PERMISSION_GRANTED
-              if (hasAudioPerm) {
-                launchVoiceRecognitionSession()
-              }
+              liveAutoListenTrigger++
             }
           },
         )
@@ -1099,6 +1214,7 @@ fun ChatScreen(
     if (isLiveVoiceMode) {
       liveSessionOpenedAt = System.currentTimeMillis()
       lastLiveUserSpokenText = ""
+      liveVoiceFeedbackMessage = null
       if (isListeningVoice) {
         isListeningVoice = false
         try {
@@ -1115,6 +1231,11 @@ fun ChatScreen(
         utteranceId = "live_jarvis_greeting_${System.currentTimeMillis()}",
         rawText = LiveGirlfriendMood.DEFAULT_OPENING_GREETING,
         mood = liveGirlfriendMood,
+        onFinished = {
+          if (isLiveVoiceMode && liveAutoHandsFree && !isListeningVoice && !uiState.isGenerating) {
+            liveAutoListenTrigger++
+          }
+        },
       )
     }
   }
@@ -2028,6 +2149,11 @@ fun ChatScreen(
               utteranceId = "live_gf_ws_text_${System.currentTimeMillis()}",
               rawText = textToSpeak,
               mood = mood,
+              onFinished = {
+                if (isLiveVoiceMode && liveAutoHandsFree && !isListeningVoice && !uiState.isGenerating) {
+                  liveAutoListenTrigger++
+                }
+              },
             )
           }
         },
@@ -2035,6 +2161,14 @@ fun ChatScreen(
           isNativeLiveAudioPlaying = isActive
           if (isActive) {
             speechController.stop()
+          }
+        },
+        autoListenTrigger = liveAutoListenTrigger,
+        externalVoiceFeedback = liveVoiceFeedbackMessage,
+        onClearExternalVoiceFeedback = { liveVoiceFeedbackMessage = null },
+        onUserTranscriptFromWs = { wsUser ->
+          if (wsUser.isNotBlank()) {
+            lastLiveUserSpokenText = wsUser
           }
         },
       )

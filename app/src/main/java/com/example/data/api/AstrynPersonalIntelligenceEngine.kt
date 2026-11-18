@@ -1973,39 +1973,58 @@ object AstrynPersonalIntelligenceEngine {
         AstrynUserProfileManager.syncFromUserPreferences(cleanUser, userPrefs)
         AstrynPreferenceEngine.ingestTurnForPreferencesAndMemory(cleanUser, query)
 
-        val timeSnap = AstrynTimeIntelligence.getCurrentSnapshot()
-        val profile = AstrynUserProfileManager.getProfile(cleanUser)
+        val lowerQuery = query.trim().lowercase(Locale.ROOT)
+        val mentionsTimeDateOrWeather =
+            shouldHandlePersonalOrEnvironmentQuery(query) ||
+                lowerQuery.containsAny(
+                    "time", "samay", "date", "tarikh", "today", "aaj", "tomorrow", "kal",
+                    "weather", "mausam", "temperature", "forecast", "schedule", "routine",
+                    "plan my", "calendar", "reminder", "morning", "evening", "night",
+                )
         val applyPersonal = AstrynPersonalizationEngine.shouldApplyPersonalContext(query)
         val relevantMemories = if (applyPersonal) {
             retrieveRelevantMemories(cleanUser, query, topK = 5)
         } else {
             emptyList()
         }
-        val activeProject = if (applyPersonal && query.lowercase().containsAny("project", "astryn", "app", "upgrade", "pending", "design", "decision")) {
+        val activeProject = if (
+            applyPersonal &&
+            lowerQuery.containsAny("project", "astryn", "app", "upgrade", "pending", "design", "decision")
+        ) {
             AstrynContextResolver.resolveTargetProject(cleanUser, query)
         } else {
             null
         }
 
+        if (!mentionsTimeDateOrWeather && relevantMemories.isEmpty() && activeProject == null) {
+            return ""
+        }
+
+        val timeSnap = AstrynTimeIntelligence.getCurrentSnapshot()
+        val profile = AstrynUserProfileManager.getProfile(cleanUser)
+
         return buildString {
-            appendLine("[PHASE 6 PERSONAL AI & LIVE ENVIRONMENT AWARENESS]")
-            appendLine("- Current Local System Time: ${timeSnap.formattedTime12h} (${timeSnap.formattedTime24h}) [${timeSnap.periodOfDay.englishLabel}]")
-            appendLine("- Today's Date: ${timeSnap.formattedDate} (${timeSnap.dayOfWeekEnglish} / ${timeSnap.dayOfWeekHindi}), TimeZone=${timeSnap.timeZoneId} (${timeSnap.utcOffsetString})")
-            appendLine("- Tomorrow's Date: ${timeSnap.tomorrowFormattedDate} (${timeSnap.tomorrowDayOfWeekEnglish})")
-            appendLine("- User Profile Preferences: Language=${profile.preferredLanguage.name}, Style=${profile.preferredStyle.name}, Depth=${profile.preferredDepth.name}, PreferredWeatherCity=${profile.preferredWeatherCity ?: "Not Set"}")
+            appendLine("[PERSONAL & ENVIRONMENT CONTEXT]")
+            if (mentionsTimeDateOrWeather) {
+                appendLine("- Local System Time: ${timeSnap.formattedTime12h} (${timeSnap.formattedTime24h}) [${timeSnap.periodOfDay.englishLabel}]")
+                appendLine("- Today: ${timeSnap.formattedDate} (${timeSnap.dayOfWeekEnglish}), TimeZone=${timeSnap.timeZoneId} (${timeSnap.utcOffsetString})")
+                if (lowerQuery.containsAny("tomorrow", "kal", "schedule", "plan")) {
+                    appendLine("- Tomorrow: ${timeSnap.tomorrowFormattedDate} (${timeSnap.tomorrowDayOfWeekEnglish})")
+                }
+                if (!profile.preferredWeatherCity.isNullOrBlank() && lowerQuery.containsAny("weather", "mausam", "temperature", "forecast", "umbrella", "rain")) {
+                    appendLine("- Preferred Weather City: ${profile.preferredWeatherCity}")
+                }
+                appendLine("- Weather Honesty: Never fabricate live weather alerts; label cached weather with its timestamp.")
+            }
             if (relevantMemories.isNotEmpty()) {
-                appendLine("- Relevant 5-Category Personal Memories:")
+                appendLine("- Relevant Personal Memories:")
                 relevantMemories.forEach { m ->
-                    appendLine("  * [${m.record.category.name}] ${m.record.key} = ${m.record.value} (score=${m.relevanceScore})")
+                    appendLine("  * [${m.record.category.name}] ${m.record.key} = ${m.record.value}")
                 }
             }
             if (activeProject != null) {
-                appendLine("- Active Project Context (${activeProject.projectName}):")
-                appendLine("  * Objective: ${activeProject.objective}")
-                appendLine("  * Locked Decisions: ${activeProject.lockedDecisions.joinToString("; ")}")
-                appendLine("  * Pending Work: ${activeProject.pendingWork.joinToString("; ")}")
+                appendLine("- Active Project (${activeProject.projectName}): ${activeProject.objective} | Locked: ${activeProject.lockedDecisions.joinToString("; ")} | Pending: ${activeProject.pendingWork.joinToString("; ")}")
             }
-            appendLine("- Honesty & Privacy Guardrails: Never fabricate live weather or alerts; label cached weather explicitly with its original timestamp; never store passwords, API keys, or precise GPS coordinates.")
         }.trim()
     }
 

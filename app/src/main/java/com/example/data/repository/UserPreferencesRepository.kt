@@ -393,6 +393,67 @@ enum class ChatBackgroundStyle(
   }
 }
 
+@Immutable
+data class KnownAccountProfile(
+  val email: String,
+  val displayName: String,
+  val canonicalUid: String = "",
+  val refreshToken: String = "",
+  val provider: String = "Google",
+  val lastUsedAt: Long = System.currentTimeMillis(),
+) {
+  companion object {
+    fun serializeList(list: List<KnownAccountProfile>): String {
+      return try {
+        val arr = JSONArray()
+        for (item in list.take(20)) {
+          val cleanEmail = item.email.trim().lowercase()
+          if (cleanEmail.isBlank()) continue
+          arr.put(
+            JSONObject().apply {
+              put("email", cleanEmail)
+              put("displayName", item.displayName.trim())
+              put("canonicalUid", item.canonicalUid.trim())
+              put("refreshToken", item.refreshToken.trim())
+              put("provider", item.provider.trim().ifBlank { "Google" })
+              put("lastUsedAt", item.lastUsedAt)
+            }
+          )
+        }
+        arr.toString()
+      } catch (_: Exception) {
+        "[]"
+      }
+    }
+
+    fun deserializeList(raw: String?): List<KnownAccountProfile> {
+      if (raw.isNullOrBlank()) return emptyList()
+      return try {
+        val arr = JSONArray(raw)
+        buildList {
+          for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val email = obj.optString("email", "").trim().lowercase()
+            if (email.isBlank()) continue
+            add(
+              KnownAccountProfile(
+                email = email,
+                displayName = obj.optString("displayName", "").trim(),
+                canonicalUid = obj.optString("canonicalUid", "").trim(),
+                refreshToken = obj.optString("refreshToken", "").trim(),
+                provider = obj.optString("provider", "Google").trim().ifBlank { "Google" },
+                lastUsedAt = obj.optLong("lastUsedAt", 0L),
+              )
+            )
+          }
+        }.sortedByDescending { it.lastUsedAt }
+      } catch (_: Exception) {
+        emptyList()
+      }
+    }
+  }
+}
+
 /**
  * Immutable snapshot of user personalization and application settings.
  */
@@ -414,6 +475,7 @@ data class UserPreferences(
   val hasSkippedAuth: Boolean = false,
   val userUid: String = "",
   val authIdToken: String = "",
+  val authRefreshToken: String = "",
   val userName: String = "",
   val userEmail: String = "",
   val userRoleBadge: String = "Pro Member",
@@ -423,6 +485,7 @@ data class UserPreferences(
   val userAvatarPath: String = "",
   val userAvatarPreset: String = "CYBER_CYAN",
   val firebaseWebApiKey: String = "",
+  val knownAccounts: List<KnownAccountProfile> = emptyList(),
 ) {
   /**
    * Returns all available prompt templates (custom templates first, followed by built-in templates).
@@ -484,6 +547,7 @@ class UserPreferencesRepository(
     private const val KEY_HAS_SKIPPED_AUTH = "pref_auth_has_skipped"
     private const val KEY_USER_UID = "pref_auth_user_uid"
     private const val KEY_AUTH_ID_TOKEN = "pref_auth_id_token"
+    private const val KEY_AUTH_REFRESH_TOKEN = "pref_auth_refresh_token"
     private const val KEY_USER_NAME = "pref_auth_user_name"
     private const val KEY_USER_EMAIL = "pref_auth_user_email"
     private const val KEY_USER_ROLE_BADGE = "pref_auth_user_role_badge"
@@ -493,6 +557,7 @@ class UserPreferencesRepository(
     private const val KEY_USER_AVATAR_PATH = "pref_auth_user_avatar_path"
     private const val KEY_USER_AVATAR_PRESET = "pref_auth_user_avatar_preset"
     private const val KEY_FIREBASE_WEB_API_KEY = "pref_auth_firebase_web_api_key"
+    private const val KEY_KNOWN_ACCOUNTS = "pref_auth_known_accounts_json"
 
     fun deriveCleanNameFromEmail(email: String, rawName: String = ""): String {
       val trimmedName = rawName.trim()
@@ -642,6 +707,83 @@ class UserPreferencesRepository(
     updateAndPersist { it.copy(moodReactiveBg = enabled) }
   }
 
+  fun getCanonicalUidForEmail(email: String): String? {
+    val cleanEmail = email.trim().lowercase()
+    if (cleanEmail.isBlank()) return null
+    return _preferencesFlow.value.knownAccounts
+      .firstOrNull { it.email.equals(cleanEmail, ignoreCase = true) }
+      ?.canonicalUid
+      ?.takeIf { it.isNotBlank() }
+  }
+
+  fun getRefreshTokenForEmail(email: String): String? {
+    val cleanEmail = email.trim().lowercase()
+    if (cleanEmail.isBlank()) return null
+    val current = _preferencesFlow.value
+    if (current.userEmail.equals(cleanEmail, ignoreCase = true) && current.authRefreshToken.isNotBlank()) {
+      return current.authRefreshToken
+    }
+    return current.knownAccounts
+      .firstOrNull { it.email.equals(cleanEmail, ignoreCase = true) }
+      ?.refreshToken
+      ?.takeIf { it.isNotBlank() }
+  }
+
+  private fun upsertKnownAccountList(
+    existingList: List<KnownAccountProfile>,
+    email: String,
+    displayName: String,
+    canonicalUid: String,
+    refreshToken: String,
+    provider: String,
+  ): List<KnownAccountProfile> {
+    val cleanEmail = email.trim().lowercase()
+    if (cleanEmail.isBlank()) return existingList
+    val previous = existingList.firstOrNull { it.email.equals(cleanEmail, ignoreCase = true) }
+    val resolvedName =
+      deriveCleanNameFromEmail(
+        email = cleanEmail,
+        rawName = displayName.ifBlank { previous?.displayName.orEmpty() },
+      )
+    val resolvedUid = canonicalUid.trim().ifBlank { previous?.canonicalUid.orEmpty() }
+    val resolvedRefresh = refreshToken.trim().ifBlank { previous?.refreshToken.orEmpty() }
+    val entry =
+      KnownAccountProfile(
+        email = cleanEmail,
+        displayName = resolvedName,
+        canonicalUid = resolvedUid,
+        refreshToken = resolvedRefresh,
+        provider = provider.trim().ifBlank { previous?.provider ?: "Google" },
+        lastUsedAt = System.currentTimeMillis(),
+      )
+    return (listOf(entry) + existingList.filterNot { it.email.equals(cleanEmail, ignoreCase = true) })
+      .take(20)
+  }
+
+  fun registerKnownAccount(
+    email: String,
+    displayName: String = "",
+    canonicalUid: String = "",
+    refreshToken: String = "",
+    provider: String = "Google",
+  ) {
+    val cleanEmail = email.trim().lowercase()
+    if (cleanEmail.isBlank()) return
+    updateAndPersist { current ->
+      current.copy(
+        knownAccounts =
+          upsertKnownAccountList(
+            existingList = current.knownAccounts,
+            email = cleanEmail,
+            displayName = displayName,
+            canonicalUid = canonicalUid,
+            refreshToken = refreshToken,
+            provider = provider,
+          )
+      )
+    }
+  }
+
   fun signInUser(
     name: String,
     email: String,
@@ -649,6 +791,7 @@ class UserPreferencesRepository(
     provider: String = "Email",
     uid: String = "",
     idToken: String = "",
+    refreshToken: String = "",
   ) {
     val cleanEmail = email.trim().lowercase()
     val cleanName = deriveCleanNameFromEmail(email = cleanEmail, rawName = name)
@@ -656,20 +799,38 @@ class UserPreferencesRepository(
       roleBadge.trim().let {
         if (it.isBlank() || it.equals("AI Explorer", ignoreCase = true)) "Pro Member" else it
       }
+    val existingRegistryUid = getCanonicalUidForEmail(cleanEmail).orEmpty()
     val resolvedUid =
       uid.trim().ifBlank {
-        "uid_${cleanEmail.hashCode().toUInt()}"
+        existingRegistryUid.ifBlank {
+          "uid_${cleanEmail.hashCode().toUInt()}"
+        }
       }
+    val resolvedRefresh =
+      refreshToken.trim().ifBlank {
+        getRefreshTokenForEmail(cleanEmail).orEmpty()
+      }
+    val cleanProvider = provider.trim().ifBlank { "Email" }
     updateAndPersist {
       it.copy(
         isLoggedIn = true,
         hasSkippedAuth = false,
         userUid = resolvedUid,
         authIdToken = idToken.trim(),
+        authRefreshToken = resolvedRefresh,
         userName = cleanName,
         userEmail = cleanEmail,
         userRoleBadge = cleanBadge,
-        authProvider = provider.trim().ifBlank { "Email" },
+        authProvider = cleanProvider,
+        knownAccounts =
+          upsertKnownAccountList(
+            existingList = it.knownAccounts,
+            email = cleanEmail,
+            displayName = cleanName,
+            canonicalUid = resolvedUid,
+            refreshToken = resolvedRefresh,
+            provider = cleanProvider,
+          ),
       )
     }
   }
@@ -691,6 +852,19 @@ class UserPreferencesRepository(
         userRoleBadge = cleanRole,
         userBio = bio.trim().take(160).ifBlank { "Personal AI Workspace & Cloud Vault" },
         userPhone = phone.trim().take(24),
+        knownAccounts =
+          if (current.userEmail.isNotBlank()) {
+            upsertKnownAccountList(
+              existingList = current.knownAccounts,
+              email = current.userEmail,
+              displayName = cleanName,
+              canonicalUid = current.userUid,
+              refreshToken = current.authRefreshToken,
+              provider = current.authProvider,
+            )
+          } else {
+            current.knownAccounts
+          },
       )
     }
   }
@@ -702,14 +876,41 @@ class UserPreferencesRepository(
       current.copy(
         userEmail = cleanEmail,
         authIdToken = newIdToken?.trim() ?: current.authIdToken,
+        knownAccounts =
+          upsertKnownAccountList(
+            existingList = current.knownAccounts,
+            email = cleanEmail,
+            displayName = current.userName,
+            canonicalUid = current.userUid,
+            refreshToken = current.authRefreshToken,
+            provider = current.authProvider,
+          ),
       )
     }
   }
 
-  fun updateAuthIdToken(newIdToken: String) {
-    if (newIdToken.isBlank()) return
+  fun updateAuthIdToken(newIdToken: String, newRefreshToken: String = "") {
+    if (newIdToken.isBlank() && newRefreshToken.isBlank()) return
     updateAndPersist { current ->
-      current.copy(authIdToken = newIdToken.trim())
+      val resolvedToken = newIdToken.trim().ifBlank { current.authIdToken }
+      val resolvedRefresh = newRefreshToken.trim().ifBlank { current.authRefreshToken }
+      current.copy(
+        authIdToken = resolvedToken,
+        authRefreshToken = resolvedRefresh,
+        knownAccounts =
+          if (current.userEmail.isNotBlank()) {
+            upsertKnownAccountList(
+              existingList = current.knownAccounts,
+              email = current.userEmail,
+              displayName = current.userName,
+              canonicalUid = current.userUid,
+              refreshToken = resolvedRefresh,
+              provider = current.authProvider,
+            )
+          } else {
+            current.knownAccounts
+          },
+      )
     }
   }
 
@@ -738,6 +939,7 @@ class UserPreferencesRepository(
         hasSkippedAuth = true,
         userUid = "guest_local_session",
         authIdToken = "",
+        authRefreshToken = "",
         userName = "Guest User",
         userEmail = "",
         userRoleBadge = "Guest Mode",
@@ -753,6 +955,7 @@ class UserPreferencesRepository(
         hasSkippedAuth = false,
         userUid = "",
         authIdToken = "",
+        authRefreshToken = "",
         userName = "",
         userEmail = "",
         userRoleBadge = "Pro Member",
@@ -762,12 +965,20 @@ class UserPreferencesRepository(
   }
 
   fun deleteUserAccount() {
-    updateAndPersist {
-      it.copy(
+    updateAndPersist { current ->
+      val deletedEmail = current.userEmail.trim().lowercase()
+      val remainingAccounts =
+        if (deletedEmail.isBlank()) {
+          current.knownAccounts
+        } else {
+          current.knownAccounts.filterNot { it.email.equals(deletedEmail, ignoreCase = true) }
+        }
+      current.copy(
         isLoggedIn = false,
         hasSkippedAuth = false,
         userUid = "",
         authIdToken = "",
+        authRefreshToken = "",
         userName = "",
         userEmail = "",
         userRoleBadge = "Pro Member",
@@ -775,6 +986,7 @@ class UserPreferencesRepository(
         userBio = "Personal AI Workspace & Cloud Vault",
         userPhone = "",
         userAvatarPath = "",
+        knownAccounts = remainingAccounts,
       )
     }
   }
@@ -812,17 +1024,28 @@ class UserPreferencesRepository(
   }
 
   /**
-   * Resets all user preferences back to safe defaults without affecting chat history
-   * or API key configuration.
+   * Resets user theme/model/prompt settings back to safe defaults without signing out,
+   * affecting chat history, known account identities, or API key configuration.
    */
   fun resetToDefaults() {
-    val defaults = UserPreferences()
-    _preferencesFlow.value = defaults
-    try {
-      sharedPreferences?.edit()?.clear()?.apply()
-      _storageErrorFlow.value = null
-    } catch (e: Exception) {
-      _storageErrorFlow.value = "Failed to clear preferences in local storage."
+    updateAndPersist { current ->
+      UserPreferences(
+        isLoggedIn = current.isLoggedIn,
+        hasSkippedAuth = current.hasSkippedAuth,
+        userUid = current.userUid,
+        authIdToken = current.authIdToken,
+        authRefreshToken = current.authRefreshToken,
+        userName = current.userName,
+        userEmail = current.userEmail,
+        userRoleBadge = current.userRoleBadge,
+        authProvider = current.authProvider,
+        userBio = current.userBio,
+        userPhone = current.userPhone,
+        userAvatarPath = current.userAvatarPath,
+        userAvatarPreset = current.userAvatarPreset,
+        firebaseWebApiKey = current.firebaseWebApiKey,
+        knownAccounts = current.knownAccounts,
+      )
     }
   }
 
@@ -851,6 +1074,7 @@ class UserPreferencesRepository(
       val hasSkippedAuth = try { prefs.getBoolean(KEY_HAS_SKIPPED_AUTH, false) } catch (_: Exception) { false }
       val rawUid = try { prefs.getString(KEY_USER_UID, "") ?: "" } catch (_: Exception) { "" }
       val authIdToken = try { prefs.getString(KEY_AUTH_ID_TOKEN, "") ?: "" } catch (_: Exception) { "" }
+      val authRefreshToken = try { prefs.getString(KEY_AUTH_REFRESH_TOKEN, "") ?: "" } catch (_: Exception) { "" }
       val rawUserName = try { prefs.getString(KEY_USER_NAME, "") ?: "" } catch (_: Exception) { "" }
       val userEmail = try { prefs.getString(KEY_USER_EMAIL, "") ?: "" } catch (_: Exception) { "" }
       val rawRoleBadge = try { prefs.getString(KEY_USER_ROLE_BADGE, "Pro Member") ?: "Pro Member" } catch (_: Exception) { "Pro Member" }
@@ -860,10 +1084,17 @@ class UserPreferencesRepository(
       val userAvatarPath = try { prefs.getString(KEY_USER_AVATAR_PATH, "") ?: "" } catch (_: Exception) { "" }
       val userAvatarPreset = try { prefs.getString(KEY_USER_AVATAR_PRESET, "CYBER_CYAN") ?: "CYBER_CYAN" } catch (_: Exception) { "CYBER_CYAN" }
       val firebaseWebApiKey = try { prefs.getString(KEY_FIREBASE_WEB_API_KEY, "") ?: "" } catch (_: Exception) { "" }
+      val rawKnownAccounts = try { prefs.getString(KEY_KNOWN_ACCOUNTS, null) } catch (_: Exception) { null }
+      val parsedKnownAccounts = KnownAccountProfile.deserializeList(rawKnownAccounts)
       val resolvedUid =
         rawUid.ifBlank {
           when {
-            isLoggedIn && userEmail.isNotBlank() -> "uid_${userEmail.lowercase().hashCode().toUInt()}"
+            isLoggedIn && userEmail.isNotBlank() ->
+              parsedKnownAccounts
+                .firstOrNull { it.email.equals(userEmail.trim(), ignoreCase = true) }
+                ?.canonicalUid
+                ?.takeIf { it.isNotBlank() }
+                ?: "uid_${userEmail.lowercase().hashCode().toUInt()}"
             hasSkippedAuth -> "guest_local_session"
             else -> ""
           }
@@ -900,6 +1131,7 @@ class UserPreferencesRepository(
         hasSkippedAuth = hasSkippedAuth,
         userUid = resolvedUid,
         authIdToken = authIdToken,
+        authRefreshToken = authRefreshToken,
         userName = userName,
         userEmail = userEmail,
         userRoleBadge = userRoleBadge,
@@ -909,6 +1141,7 @@ class UserPreferencesRepository(
         userAvatarPath = userAvatarPath,
         userAvatarPreset = userAvatarPreset,
         firebaseWebApiKey = firebaseWebApiKey,
+        knownAccounts = parsedKnownAccounts,
       )
     } catch (e: Exception) {
       UserPreferences()
@@ -939,6 +1172,7 @@ class UserPreferencesRepository(
         .putBoolean(KEY_HAS_SKIPPED_AUTH, preferences.hasSkippedAuth)
         .putString(KEY_USER_UID, preferences.userUid)
         .putString(KEY_AUTH_ID_TOKEN, preferences.authIdToken)
+        .putString(KEY_AUTH_REFRESH_TOKEN, preferences.authRefreshToken)
         .putString(KEY_USER_NAME, preferences.userName)
         .putString(KEY_USER_EMAIL, preferences.userEmail)
         .putString(KEY_USER_ROLE_BADGE, preferences.userRoleBadge)
@@ -948,6 +1182,7 @@ class UserPreferencesRepository(
         .putString(KEY_USER_AVATAR_PATH, preferences.userAvatarPath)
         .putString(KEY_USER_AVATAR_PRESET, preferences.userAvatarPreset)
         .putString(KEY_FIREBASE_WEB_API_KEY, preferences.firebaseWebApiKey)
+        .putString(KEY_KNOWN_ACCOUNTS, KnownAccountProfile.serializeList(preferences.knownAccounts))
         .apply()
       _storageErrorFlow.value = null
     } catch (e: Exception) {

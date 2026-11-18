@@ -23,13 +23,13 @@ public class NovaChatDatabase_Impl : NovaChatDatabase() {
     val _openDelegate: RoomOpenDelegate =
       object :
         RoomOpenDelegate(
-          4,
-          "61d4012509ef8b3a8ee8c6f833deb2f0",
-          "954f94a3c1908de11f83abde5fe77be0",
+          5,
+          "7a2c8d10e9b34f56a123b456c789d012",
+          "c3e91f2a4b7d80159e6a32c4d8f1b704",
         ) {
         public override fun createAllTables(connection: SQLiteConnection) {
           connection.execSQL(
-            "CREATE TABLE IF NOT EXISTS `conversations` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `preview` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `isPinned` INTEGER NOT NULL, `isLiked` INTEGER NOT NULL, PRIMARY KEY(`id`))"
+            "CREATE TABLE IF NOT EXISTS `conversations` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `preview` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `isPinned` INTEGER NOT NULL, `isLiked` INTEGER NOT NULL, `ownerUid` TEXT NOT NULL, PRIMARY KEY(`id`))"
           )
           connection.execSQL(
             "CREATE TABLE IF NOT EXISTS `messages` (`id` TEXT NOT NULL, `conversationId` TEXT NOT NULL, `role` TEXT NOT NULL, `content` TEXT NOT NULL, `timestamp` INTEGER NOT NULL, `status` TEXT NOT NULL, `errorMessage` TEXT, `attachmentsJson` TEXT, `citationsJson` TEXT, `isLiked` INTEGER NOT NULL, `isBookmarked` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`conversationId`) REFERENCES `conversations`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )"
@@ -41,7 +41,7 @@ public class NovaChatDatabase_Impl : NovaChatDatabase() {
             "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)"
           )
           connection.execSQL(
-            "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '61d4012509ef8b3a8ee8c6f833deb2f0')"
+            "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '7a2c8d10e9b34f56a123b456c789d012')"
           )
         }
 
@@ -94,6 +94,10 @@ public class NovaChatDatabase_Impl : NovaChatDatabase() {
           _columnsConversations.put(
             "isLiked",
             TableInfo.Column("isLiked", "INTEGER", true, 0, null, TableInfo.CREATED_FROM_ENTITY),
+          )
+          _columnsConversations.put(
+            "ownerUid",
+            TableInfo.Column("ownerUid", "TEXT", true, 0, null, TableInfo.CREATED_FROM_ENTITY),
           )
           val _foreignKeysConversations: MutableSet<TableInfo.ForeignKey> = mutableSetOf()
           val _indicesConversations: MutableSet<TableInfo.Index> = mutableSetOf()

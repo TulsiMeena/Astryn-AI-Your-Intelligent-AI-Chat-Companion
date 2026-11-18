@@ -72,10 +72,18 @@ class ChatHistoryRepository(
     if (owner != null) {
       return owner == uid
     }
+    val entityOwner = conversationsMap[conversationId]?.ownerUid?.trim().orEmpty()
+    if (entityOwner.isNotBlank()) {
+      conversationOwners[conversationId] = entityOwner
+      try {
+        ownerPrefs?.edit()?.putString("owner_$conversationId", entityOwner)?.commit()
+      } catch (_: Exception) {}
+      return entityOwner == uid
+    }
     if (conversationId.startsWith("${uid}_")) {
       conversationOwners[conversationId] = uid
       try {
-        ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.apply()
+        ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.commit()
       } catch (_: Exception) {}
       return true
     }
@@ -89,10 +97,28 @@ class ChatHistoryRepository(
       if (existingOwner == null || existingOwner == uid) {
         conversationOwners[conversationId] = uid
         try {
-          ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.apply()
+          ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.commit()
         } catch (_: Exception) {}
       }
     }
+  }
+
+  private suspend fun syncConversationToCloudIfAuthenticated(conversationId: String) {
+    val uid = activeUserUid
+    if (uid.isBlank() || uid == "__signed_out__") return
+    if (!isOwnedByActiveUser(conversationId)) return
+    val conv = conversationsMap[conversationId] ?: return
+    val list = messagesByConversation[conversationId] ?: return
+    val snapshotMessages = synchronized(list) { list.toList() }
+    if (snapshotMessages.none { it.content.isNotBlank() }) return
+    try {
+      com.example.data.api.FirebaseRestAuthClient.syncUserConversationToCloud(
+        uid = uid,
+        idToken = activeAuthIdToken,
+        conversation = conv.copy(ownerUid = uid),
+        messages = snapshotMessages,
+      )
+    } catch (_: Exception) {}
   }
 
   /**
@@ -103,6 +129,7 @@ class ChatHistoryRepository(
     uid: String,
     idToken: String = "",
     context: Context? = null,
+    aliasUidsToMigrate: Set<String> = emptySet(),
   ) =
     withContext(ioDispatcher) {
       if (context != null && ownerPrefs == null) {
@@ -123,30 +150,62 @@ class ChatHistoryRepository(
 
       activeUserUid = uid.trim()
       activeAuthIdToken = idToken.trim()
+
+      if (conversationsMap.isEmpty() && chatDao != null) {
+        loadFromStorageInternal(emitAfterLoad = false)
+      }
+
+      val currentUid = activeUserUid
+      if (currentUid.isNotBlank() && currentUid != "__signed_out__") {
+        // Safely migrate any same-email deterministic fallback alias conversations to the canonical UID
+        for (rawAlias in aliasUidsToMigrate) {
+          val alias = rawAlias.trim()
+          if (alias.isBlank() || alias == "__signed_out__" || alias == currentUid) continue
+          val aliasConvIds =
+            (conversationOwners.entries.filter { it.value == alias }.map { it.key } +
+              conversationsMap.values.filter { it.ownerUid == alias }.map { it.id })
+              .distinct()
+          for (convId in aliasConvIds) {
+            conversationOwners[convId] = currentUid
+            try {
+              ownerPrefs?.edit()?.putString("owner_$convId", currentUid)?.commit()
+            } catch (_: Exception) {}
+            conversationsMap[convId]?.let { existing ->
+              conversationsMap[convId] = existing.copy(ownerUid = currentUid)
+            }
+          }
+          try {
+            chatDao?.migrateConversationOwner(oldOwnerUid = alias, newOwnerUid = currentUid)
+          } catch (_: Exception) {}
+        }
+      }
+
       emitSortedConversations()
 
-      // If a real user is signed in, pull their isolated conversations from Firebase Cloud Vault
-      if (activeUserUid.isNotBlank() && activeUserUid != "__signed_out__") {
-        val currentUid = activeUserUid
+      // If a real user is signed in, perform bidirectional sync with their isolated Firebase Cloud Vault
+      if (currentUid.isNotBlank() && currentUid != "__signed_out__") {
         val cloudItems =
           com.example.data.api.FirebaseRestAuthClient.fetchUserConversationsFromCloud(
             uid = currentUid,
             idToken = activeAuthIdToken,
           )
+        val cloudUpdatedAtById = HashMap<String, Long>(cloudItems.size)
         if (cloudItems.isNotEmpty() && activeUserUid == currentUid) {
           for (cloudConv in cloudItems) {
             val convId = cloudConv.conversation.id
+            cloudUpdatedAtById[convId] = cloudConv.conversation.updatedAt
             val existingOwner = conversationOwners[convId]
             if (existingOwner != null && existingOwner != currentUid) continue
 
             conversationOwners[convId] = currentUid
             try {
-              ownerPrefs?.edit()?.putString("owner_$convId", currentUid)?.apply()
+              ownerPrefs?.edit()?.putString("owner_$convId", currentUid)?.commit()
             } catch (_: Exception) {}
 
+            val normalizedCloudConv = cloudConv.conversation.copy(ownerUid = currentUid)
             val localConv = conversationsMap[convId]
-            if (localConv == null || cloudConv.conversation.updatedAt >= localConv.updatedAt) {
-              conversationsMap[convId] = cloudConv.conversation
+            if (localConv == null || normalizedCloudConv.updatedAt >= localConv.updatedAt) {
+              conversationsMap[convId] = normalizedCloudConv
               if (cloudConv.messages.isNotEmpty()) {
                 messagesByConversation[convId] =
                   cloudConv.messages.sortedBy { it.timestamp }.toMutableList()
@@ -154,14 +213,15 @@ class ChatHistoryRepository(
               }
               try {
                 if (chatDao != null) {
-                  val inserted = chatDao.insertConversationIfAbsent(cloudConv.conversation)
+                  val inserted = chatDao.insertConversationIfAbsent(normalizedCloudConv)
                   if (inserted == -1L) {
                     chatDao.updateConversationMetadata(
-                      id = cloudConv.conversation.id,
-                      title = cloudConv.conversation.title,
-                      preview = cloudConv.conversation.preview,
-                      updatedAt = cloudConv.conversation.updatedAt,
+                      id = normalizedCloudConv.id,
+                      title = normalizedCloudConv.title,
+                      preview = normalizedCloudConv.preview,
+                      updatedAt = normalizedCloudConv.updatedAt,
                     )
+                    chatDao.updateConversationOwner(normalizedCloudConv.id, currentUid)
                   }
                   for (msg in cloudConv.messages) {
                     chatDao.upsertMessage(msg.toEntity(convId))
@@ -171,6 +231,18 @@ class ChatHistoryRepository(
             }
           }
           emitSortedConversations()
+        }
+
+        // Push any local-only or newer user conversations up to the cloud vault
+        if (activeUserUid == currentUid) {
+          val localOwnedConvs =
+            conversationsMap.values.filter { conv -> isOwnedByActiveUser(conv.id) }
+          for (localConv in localOwnedConvs) {
+            val cloudUpdated = cloudUpdatedAtById[localConv.id]
+            if (cloudUpdated == null || localConv.updatedAt > cloudUpdated) {
+              syncConversationToCloudIfAuthenticated(localConv.id)
+            }
+          }
         }
       }
     }
@@ -310,37 +382,49 @@ class ChatHistoryRepository(
    */
   suspend fun loadFromStorage() =
     withContext(ioDispatcher) {
-      val dao = chatDao ?: return@withContext
-      try {
-        val savedConversations = dao.getAllConversations()
-        val savedMessages = dao.getAllMessages()
-
-        val groupedMessages = savedMessages.groupBy { it.conversationId }
-
-        for (conv in savedConversations) {
-          if (conv.id.isBlank()) continue
-          val safeUpdated = if (conv.updatedAt > 0L) conv.updatedAt else System.currentTimeMillis()
-          monotonicClock.updateAndGet { prev -> maxOf(prev, safeUpdated) }
-          conversationsMap[conv.id] =
-            conv.copy(
-              title = conv.title.ifBlank { "Untitled Conversation" },
-              updatedAt = safeUpdated,
-            )
-          val mappedMessages =
-            groupedMessages[conv.id]
-              ?.mapNotNull { entity -> entity.toDomainOrNull() }
-              ?.sortedBy { it.timestamp }
-              ?: emptyList()
-          messagesByConversation[conv.id] = mappedMessages.toMutableList()
-          rebuildSearchableContentForConversation(conv.id)
-        }
-
-        emitSortedConversations()
-        _storageErrorFlow.value = null
-      } catch (e: Exception) {
-        _storageErrorFlow.value = "Unable to load saved history from device storage."
-      }
+      loadFromStorageInternal(emitAfterLoad = true)
     }
+
+  private suspend fun loadFromStorageInternal(emitAfterLoad: Boolean) {
+    val dao = chatDao ?: return
+    try {
+      val savedConversations = dao.getAllConversations()
+      val savedMessages = dao.getAllMessages()
+
+      val groupedMessages = savedMessages.groupBy { it.conversationId }
+
+      for (conv in savedConversations) {
+        if (conv.id.isBlank()) continue
+        val safeUpdated = if (conv.updatedAt > 0L) conv.updatedAt else System.currentTimeMillis()
+        monotonicClock.updateAndGet { prev -> maxOf(prev, safeUpdated) }
+        val persistedOwner = conv.ownerUid.trim()
+        if (persistedOwner.isNotBlank()) {
+          conversationOwners.putIfAbsent(conv.id, persistedOwner)
+        }
+        val resolvedOwner = conversationOwners[conv.id] ?: persistedOwner
+        conversationsMap[conv.id] =
+          conv.copy(
+            title = conv.title.ifBlank { "Untitled Conversation" },
+            updatedAt = safeUpdated,
+            ownerUid = resolvedOwner,
+          )
+        val mappedMessages =
+          groupedMessages[conv.id]
+            ?.mapNotNull { entity -> entity.toDomainOrNull() }
+            ?.sortedBy { it.timestamp }
+            ?: emptyList()
+        messagesByConversation[conv.id] = mappedMessages.toMutableList()
+        rebuildSearchableContentForConversation(conv.id)
+      }
+
+      if (emitAfterLoad) {
+        emitSortedConversations()
+      }
+      _storageErrorFlow.value = null
+    } catch (e: Exception) {
+      _storageErrorFlow.value = "Unable to load saved history from device storage."
+    }
+  }
 
   /**
    * Saves or updates a message inside a conversation, automatically creating or updating
@@ -449,6 +533,13 @@ class ChatHistoryRepository(
             .take(PREVIEW_MAX_LENGTH)
             .ifBlank { existingConv?.preview ?: "" }
 
+        val resolvedOwnerUid =
+          if (activeUserUid.isNotBlank() && activeUserUid != "__signed_out__") {
+            activeUserUid
+          } else {
+            conversationOwners[conversationId] ?: existingConv?.ownerUid.orEmpty()
+          }
+
         val updatedConv =
           ConversationEntity(
             id = conversationId,
@@ -458,6 +549,7 @@ class ChatHistoryRepository(
             updatedAt = guaranteedUpdatedAt,
             isPinned = existingConv?.isPinned ?: false,
             isLiked = existingConv?.isLiked ?: false,
+            ownerUid = resolvedOwnerUid,
           )
 
         conversationsMap[conversationId] = updatedConv
@@ -473,6 +565,9 @@ class ChatHistoryRepository(
               preview = updatedConv.preview,
               updatedAt = updatedConv.updatedAt,
             )
+            if (resolvedOwnerUid.isNotBlank() && existingConv?.ownerUid != resolvedOwnerUid) {
+              chatDao.updateConversationOwner(updatedConv.id, resolvedOwnerUid)
+            }
           }
           chatDao.upsertMessage(safeMessage.toEntity(conversationId))
         }
@@ -613,6 +708,7 @@ class ChatHistoryRepository(
           )
         }
         emitSortedConversations()
+        syncConversationToCloudIfAuthenticated(conversationId)
         Result.success(Unit)
       } catch (e: Exception) {
         _storageErrorFlow.value = "Failed to update conversation messages."
@@ -665,6 +761,7 @@ class ChatHistoryRepository(
           title = sanitized,
           updatedAt = updatedAt,
         )
+        syncConversationToCloudIfAuthenticated(conversationId)
         _storageErrorFlow.value = null
         Result.success(sanitized)
       } catch (e: Exception) {
@@ -693,7 +790,7 @@ class ChatHistoryRepository(
         searchableContentByConversation.remove(conversationId)
         conversationOwners.remove(conversationId)
         try {
-          ownerPrefs?.edit()?.remove("owner_$conversationId")?.apply()
+          ownerPrefs?.edit()?.remove("owner_$conversationId")?.commit()
         } catch (_: Exception) {}
         com.example.ui.components.SafeMarkdownParser.clearCaches()
         emitSortedConversations()
@@ -733,7 +830,7 @@ class ChatHistoryRepository(
             searchableContentByConversation.remove(convId)
             conversationOwners.remove(convId)
             try {
-              ownerPrefs?.edit()?.remove("owner_$convId")?.apply()
+              ownerPrefs?.edit()?.remove("owner_$convId")?.commit()
             } catch (_: Exception) {}
             chatDao?.deleteAllMessagesForConversation(convId)
             chatDao?.deleteConversationById(convId)
@@ -759,6 +856,49 @@ class ChatHistoryRepository(
         Result.success(Unit)
       } catch (e: Exception) {
         _storageErrorFlow.value = "Failed to clear chat history from storage."
+        Result.failure(e)
+      }
+    }
+
+  /**
+   * Deterministically deletes all conversations owned by [uid] without depending on [activeUserUid]
+   * timing during account deletion.
+   */
+  suspend fun clearConversationsForUser(uid: String): Result<Unit> =
+    withContext(ioDispatcher) {
+      val cleanUid = uid.trim()
+      if (cleanUid.isBlank() || cleanUid == "__signed_out__") {
+        return@withContext Result.success(Unit)
+      }
+      try {
+        val ownedIds =
+          conversationsMap.keys.filter { convId ->
+            conversationOwners[convId] == cleanUid ||
+              conversationsMap[convId]?.ownerUid == cleanUid ||
+              convId.startsWith("${cleanUid}_")
+          }
+        for (convId in ownedIds) {
+          conversationsMap.remove(convId)
+          messagesByConversation.remove(convId)
+          searchableContentByConversation.remove(convId)
+          conversationOwners.remove(convId)
+          try {
+            ownerPrefs?.edit()?.remove("owner_$convId")?.commit()
+          } catch (_: Exception) {}
+          chatDao?.deleteAllMessagesForConversation(convId)
+          chatDao?.deleteConversationById(convId)
+          com.example.data.api.FirebaseRestAuthClient.deleteUserConversationFromCloud(
+            uid = cleanUid,
+            idToken = activeAuthIdToken,
+            conversationId = convId,
+          )
+        }
+        com.example.ui.components.SafeMarkdownParser.clearCaches()
+        emitSortedConversations()
+        _storageErrorFlow.value = null
+        Result.success(Unit)
+      } catch (e: Exception) {
+        _storageErrorFlow.value = "Failed to clear account chat history from storage."
         Result.failure(e)
       }
     }
@@ -800,6 +940,7 @@ class ChatHistoryRepository(
           isPinned = nextPinned,
           updatedAt = updatedAt,
         )
+        syncConversationToCloudIfAuthenticated(conversationId)
         _storageErrorFlow.value = null
         Result.success(nextPinned)
       } catch (e: Exception) {
@@ -832,6 +973,7 @@ class ChatHistoryRepository(
           isLiked = nextLiked,
           updatedAt = updatedAt,
         )
+        syncConversationToCloudIfAuthenticated(conversationId)
         _storageErrorFlow.value = null
         Result.success(nextLiked)
       } catch (e: Exception) {
@@ -874,6 +1016,7 @@ class ChatHistoryRepository(
         }
         if (updatedMessage != null) {
           chatDao?.updateMessageLiked(messageId = messageId, isLiked = nextLikedState)
+          syncConversationToCloudIfAuthenticated(conversationId)
           Result.success(nextLikedState)
         } else {
           Result.failure(IllegalStateException("Message not found."))
@@ -921,6 +1064,7 @@ class ChatHistoryRepository(
             messageId = messageId,
             isBookmarked = nextBookmarkedState,
           )
+          syncConversationToCloudIfAuthenticated(conversationId)
           Result.success(nextBookmarkedState)
         } else {
           Result.failure(IllegalStateException("Message not found."))

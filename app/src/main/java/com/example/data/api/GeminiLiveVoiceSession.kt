@@ -87,6 +87,7 @@ data class LiveVoiceSessionSnapshot(
   val liveAssistantTranscript: String = "",
   val errorMessage: String? = null,
   val lastExecutedToolLabel: String? = null,
+  val isUsingFallbackVoiceEngine: Boolean = false,
 )
 
 /**
@@ -246,6 +247,7 @@ class GeminiLiveVoiceSession(
   private val onInterrupted: () -> Unit = {},
   private val onMoodChangedByTool: (LiveGirlfriendMood) -> Unit = {},
   private val onError: (String) -> Unit = {},
+  private val onFallbackToDeviceVoiceRequested: () -> Unit = {},
 ) {
   private val sessionLock = Any()
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -260,6 +262,7 @@ class GeminiLiveVoiceSession(
   private val isWhisperMode = AtomicBoolean(false)
   private val isExternalTtsSpeaking = AtomicBoolean(false)
   private var activeModelIndex: Int = 0
+  private var includeToolsInSetup: Boolean = true
   private var reconnectAttempts: Int = 0
   private var reconnectJob: Job? = null
   private var pendingTextTurnBeforeSetup: String? = null
@@ -273,6 +276,9 @@ class GeminiLiveVoiceSession(
   private var noiseSuppressor: NoiseSuppressor? = null
   private var gainControl: AutomaticGainControl? = null
   private var consecutiveBargeInFrames: Int = 0
+  private val hadMicSpeechInCurrentBurst = AtomicBoolean(false)
+  private val hasFlushedStreamEndForBurst = AtomicBoolean(false)
+  private var lastSpeechActiveTimeMs: Long = 0L
 
   // Speaker AudioTrack playback queue (24kHz default, mono, 16-bit PCM streaming)
   private val audioPlaybackQueue = LinkedBlockingQueue<PcmAudioChunk>(MAX_PLAYBACK_QUEUE_CHUNKS)
@@ -295,19 +301,18 @@ class GeminiLiveVoiceSession(
       "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
     /**
-     * Ordered list of Gemini Multimodal Live API models (`models/gemini-2.0-flash` primary with
-     * automatic fallback candidates).
+     * Ordered list of Gemini Multimodal Live API models (`models/gemini-2.5-flash-native-audio-preview-12-2025`
+     * primary with automatic fallback candidates supporting BidiGenerateContent).
      */
     val SUPPORTED_LIVE_MODELS: List<String> =
       listOf(
-        "models/gemini-2.0-flash",
+        "models/gemini-2.5-flash-native-audio-preview-12-2025",
+        "models/gemini-2.5-flash-native-audio-preview-09-2025",
         "models/gemini-2.0-flash-live-001",
         "models/gemini-2.0-flash-exp",
-        "models/gemini-2.5-flash-native-audio-preview-12-2025",
-        "models/gemini-2.5-flash",
       )
 
-    const val DEFAULT_LIVE_MODEL = "models/gemini-2.0-flash"
+    const val DEFAULT_LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
     const val LIVE_FEMALE_VOICE_NAME = "Aoede"
 
     const val PCM_INPUT_SAMPLE_RATE = 16000
@@ -317,7 +322,9 @@ class GeminiLiveVoiceSession(
     private const val MAX_PLAYBACK_QUEUE_CHUNKS = 600
     private const val MAX_RECONNECT_ATTEMPTS = 3
 
-    // Adaptive barge-in threshold when AI audio is actively playing
+    // Adaptive barge-in & VAD silence flush thresholds
+    private const val MIC_VOICE_ACTIVE_RMS_THRESHOLD = 280.0
+    private const val MIC_SILENCE_TURN_END_MS = 1200L
     private const val BARGE_IN_RMS_THRESHOLD_WITH_AEC = 1900.0
     private const val BARGE_IN_RMS_THRESHOLD_NO_AEC = 3200.0
     private const val BARGE_IN_REQUIRED_CONSECUTIVE_FRAMES = 6 // ~180ms at 30ms/chunk
@@ -390,6 +397,8 @@ class GeminiLiveVoiceSession(
           .put("model", normalizedModel)
           .put("generationConfig", generationConfig)
           .put("systemInstruction", systemInstruction)
+          .put("inputAudioTranscription", JSONObject())
+          .put("outputAudioTranscription", JSONObject())
 
       if (includeTools) {
         val functionDeclarations =
@@ -478,6 +487,16 @@ class GeminiLiveVoiceSession(
     }
 
     /**
+     * Builds a Gemini Live API `realtimeInput.audioStreamEnd` frame to signal end-of-speech/pause
+     * so native audio models immediately process buffered speech and respond.
+     */
+    fun buildRealtimeAudioStreamEndFrameJson(): String {
+      return JSONObject()
+        .put("realtimeInput", JSONObject().put("audioStreamEnd", true))
+        .toString()
+    }
+
+    /**
      * Converts a 16-bit signed PCM [ShortArray] (length [shortCount]) into a Little-Endian [ByteArray].
      */
     fun shortsToLittleEndianBytes(samples: ShortArray, shortCount: Int = samples.size): ByteArray {
@@ -560,7 +579,10 @@ class GeminiLiveVoiceSession(
     fun cleanForGirlfriendSpeech(raw: String): String {
       if (raw.isBlank()) return ""
       return raw
-        .replace(Regex("\\*[^*]{1,30}\\*"), " ") // strip stage actions like *giggles* or *smiles*
+        .replace(
+          Regex("(?<!\\*)\\*(?!\\*)[^*\\n]{1,30}(?<!\\*)\\*(?!\\*)"),
+          " ",
+        ) // strip stage actions like *giggles* or *smiles* without deleting **bold** words
         .replace(Regex("[\\uD83C-\\uDBFF\\uDC00-\\uDFFF]+"), " ") // strip surrogate-pair emojis so TTS never reads emoji names
         .replace(Regex("[\\u2600-\\u27BF]+"), " ") // strip misc symbols/dingbats
         .replace(Regex("[*_`#~>|]"), "")
@@ -1443,7 +1465,32 @@ class GeminiLiveVoiceSession(
       }
       isDisconnectingIntentionally.set(false)
       reconnectAttempts = 0
+      if (!isSocketOpen.get()) {
+        activeModelIndex = 0
+        includeToolsInSetup = true
+      }
       openWebSocketInternal(mood)
+    }
+  }
+
+  private fun activateFallbackDeviceVoiceMode() {
+    val wasMicActive = isMicRecording.get()
+    if (wasMicActive) {
+      stopMicrophoneStreaming()
+    }
+    updateState {
+      it.copy(
+        connectionState = LiveConnectionState.DISCONNECTED,
+        interactionState = LiveVoiceInteractionState.IDLE,
+        isSetupComplete = false,
+        isUsingFallbackVoiceEngine = true,
+        errorMessage = null,
+      )
+    }
+    if (wasMicActive) {
+      try {
+        onFallbackToDeviceVoiceRequested()
+      } catch (_: Exception) {}
     }
   }
 
@@ -1452,26 +1499,12 @@ class GeminiLiveVoiceSession(
       try {
         apiKeyProvider().trim()
       } catch (_: Throwable) {
-        updateState {
-          it.copy(
-            connectionState = LiveConnectionState.CONNECTED_READY,
-            interactionState = LiveVoiceInteractionState.IDLE,
-            isSetupComplete = true,
-            errorMessage = null,
-          )
-        }
+        activateFallbackDeviceVoiceMode()
         return
       }
 
     if (apiKey.isEmpty()) {
-      updateState {
-        it.copy(
-          connectionState = LiveConnectionState.CONNECTED_READY,
-          interactionState = LiveVoiceInteractionState.IDLE,
-          isSetupComplete = true,
-          errorMessage = null,
-        )
-      }
+      activateFallbackDeviceVoiceMode()
       return
     }
 
@@ -1489,6 +1522,7 @@ class GeminiLiveVoiceSession(
           else LiveConnectionState.CONNECTING,
         activeModelId = candidateModel,
         isSetupComplete = false,
+        isUsingFallbackVoiceEngine = false,
         errorMessage = null,
       )
     }
@@ -1512,6 +1546,7 @@ class GeminiLiveVoiceSession(
               it.copy(
                 connectionState = LiveConnectionState.HANDSHAKING,
                 activeModelId = candidateModel,
+                isUsingFallbackVoiceEngine = false,
                 errorMessage = null,
               )
             }
@@ -1519,7 +1554,7 @@ class GeminiLiveVoiceSession(
               buildSetupFrameJson(
                 mood = mood,
                 modelName = candidateModel,
-                includeTools = true,
+                includeTools = includeToolsInSetup,
                 isWhisperMode = isWhisperMode.get(),
               )
             webSocket.send(setupPayload)
@@ -1581,7 +1616,7 @@ class GeminiLiveVoiceSession(
   ) {
     val lowerReason = reason.lowercase(Locale.US)
 
-    // 1. Check for Authentication / API Key errors -> seamlessly switch to local JARVIS voice brain without error state
+    // 1. Check for Authentication / API Key errors -> switch cleanly to fallback device voice engine
     if (
       httpStatus == 401 ||
         httpStatus == 403 ||
@@ -1590,49 +1625,36 @@ class GeminiLiveVoiceSession(
         lowerReason.contains("permission_denied") ||
         lowerReason.contains("unauthenticated")
     ) {
-      updateState {
-        it.copy(
-          connectionState = LiveConnectionState.CONNECTED_READY,
-          interactionState = LiveVoiceInteractionState.IDLE,
-          isSetupComplete = true,
-          errorMessage = null,
-        )
-      }
+      activateFallbackDeviceVoiceMode()
       return
     }
 
-    // 2. Check for Rate Limit / Quota Exceeded (429 / 1013) -> seamlessly switch to local JARVIS voice brain
+    // 2. Check for Rate Limit / Quota Exceeded (429 / 1013) -> switch cleanly to fallback device voice engine
     if (
       httpStatus == 429 ||
         lowerReason.contains("quota") ||
         lowerReason.contains("rate limit") ||
         lowerReason.contains("resource_exhausted")
     ) {
-      updateState {
-        it.copy(
-          connectionState = LiveConnectionState.CONNECTED_READY,
-          interactionState = LiveVoiceInteractionState.IDLE,
-          isSetupComplete = true,
-          errorMessage = null,
-        )
-      }
+      activateFallbackDeviceVoiceMode()
       return
     }
 
-    // 3. Check for Unsupported / Unavailable Model -> Automatically step to next fallback model
-    val isModelError =
-      httpStatus == 404 ||
-        code == 1008 ||
-        lowerReason.contains("not found") ||
-        lowerReason.contains("not supported") ||
-        lowerReason.contains("invalid argument") ||
-        lowerReason.contains("model")
-    if (isModelError && activeModelIndex + 1 < SUPPORTED_LIVE_MODELS.size) {
-      activeModelIndex++
+    // 3. If handshake failed with tools enabled, retry same model without function declarations first
+    val isSetupRejection =
+      !isSetupComplete.get() &&
+        (code == 1007 ||
+          code == 1008 ||
+          httpStatus == 400 ||
+          lowerReason.contains("invalid") ||
+          lowerReason.contains("tool") ||
+          lowerReason.contains("schema"))
+    if (isSetupRejection && includeToolsInSetup) {
+      includeToolsInSetup = false
       reconnectJob?.cancel()
       reconnectJob =
         scope.launch {
-          delay(250L)
+          delay(150L)
           if (!isDisconnectingIntentionally.get()) {
             openWebSocketInternal(currentMood)
           }
@@ -1640,7 +1662,33 @@ class GeminiLiveVoiceSession(
       return
     }
 
-    // 4. Transient network failure -> Exponential backoff reconnect, then seamless ready state
+    // 4. Check for Unsupported / Unavailable Model -> Automatically step to next fallback model
+    val isModelError =
+      httpStatus == 404 ||
+        httpStatus == 400 ||
+        code == 1007 ||
+        code == 1008 ||
+        lowerReason.contains("not found") ||
+        lowerReason.contains("not supported") ||
+        lowerReason.contains("unsupported") ||
+        lowerReason.contains("invalid argument") ||
+        lowerReason.contains("bidi") ||
+        lowerReason.contains("model")
+    if (isModelError && activeModelIndex + 1 < SUPPORTED_LIVE_MODELS.size) {
+      activeModelIndex++
+      includeToolsInSetup = true
+      reconnectJob?.cancel()
+      reconnectJob =
+        scope.launch {
+          delay(200L)
+          if (!isDisconnectingIntentionally.get()) {
+            openWebSocketInternal(currentMood)
+          }
+        }
+      return
+    }
+
+    // 5. Transient network failure -> Exponential backoff reconnect, then fallback device voice engine
     if (!isModelError && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       reconnectAttempts++
       val backoffMs = 800L * (1 shl (reconnectAttempts - 1))
@@ -1660,14 +1708,7 @@ class GeminiLiveVoiceSession(
           }
         }
     } else {
-      updateState {
-        it.copy(
-          connectionState = LiveConnectionState.CONNECTED_READY,
-          interactionState = LiveVoiceInteractionState.IDLE,
-          isSetupComplete = true,
-          errorMessage = null,
-        )
-      }
+      activateFallbackDeviceVoiceMode()
     }
   }
 
@@ -2061,6 +2102,9 @@ class GeminiLiveVoiceSession(
     audioRecord = record
     isMicRecording.set(true)
     consecutiveBargeInFrames = 0
+    hadMicSpeechInCurrentBurst.set(false)
+    hasFlushedStreamEndForBurst.set(false)
+    lastSpeechActiveTimeMs = System.currentTimeMillis()
 
     updateState {
       it.copy(
@@ -2123,6 +2167,14 @@ class GeminiLiveVoiceSession(
                 consecutiveBargeInFrames = 0
               }
 
+              // Track voice activity so sustained post-speech pause flushes audioStreamEnd
+              val nowMs = System.currentTimeMillis()
+              if (rms >= MIC_VOICE_ACTIVE_RMS_THRESHOLD) {
+                hadMicSpeechInCurrentBurst.set(true)
+                hasFlushedStreamEndForBurst.set(false)
+                lastSpeechActiveTimeMs = nowMs
+              }
+
               // Stream 30ms 16kHz Little-Endian PCM chunk over Gemini Live WebSocket once setup is complete
               val ws = webSocket
               if (ws != null && isSocketOpen.get() && isSetupComplete.get()) {
@@ -2131,6 +2183,25 @@ class GeminiLiveVoiceSession(
                 try {
                   ws.send(frameJson)
                 } catch (_: Exception) {}
+
+                if (
+                  hadMicSpeechInCurrentBurst.get() &&
+                    !hasFlushedStreamEndForBurst.get() &&
+                    (nowMs - lastSpeechActiveTimeMs) >= MIC_SILENCE_TURN_END_MS
+                ) {
+                  hasFlushedStreamEndForBurst.set(true)
+                  hadMicSpeechInCurrentBurst.set(false)
+                  try {
+                    ws.send(buildRealtimeAudioStreamEndFrameJson())
+                    updateState { state ->
+                      if (!isPlayingNativeAudio.get() && !isMicMuted.get()) {
+                        state.copy(interactionState = LiveVoiceInteractionState.PROCESSING)
+                      } else {
+                        state
+                      }
+                    }
+                  } catch (_: Exception) {}
+                }
               }
             } else if (readShorts < 0) {
               break
@@ -2147,11 +2218,13 @@ class GeminiLiveVoiceSession(
 
   @Suppress("MissingPermission")
   private fun createAudioRecordWithFallback(bufferSizeInBytes: Int): AudioRecord? {
-    // Prefer VOICE_COMMUNICATION so Android DSP engages hardware Acoustic Echo Cancellation
+    // Prefer VOICE_RECOGNITION so loudspeaker AudioTrack (USAGE_MEDIA) does not attenuate mic gain,
+    // while keeping MIC and VOICE_COMMUNICATION as automatic hardware fallbacks.
     val sources =
       listOf(
-        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+        MediaRecorder.AudioSource.VOICE_RECOGNITION,
         MediaRecorder.AudioSource.MIC,
+        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
       )
     for (source in sources) {
       try {
@@ -2221,9 +2294,27 @@ class GeminiLiveVoiceSession(
   }
 
   /**
+   * Explicitly flushes the active Gemini Live audio stream so the server immediately processes
+   * the user's buffered speech and replies.
+   */
+  fun sendAudioStreamEnd(): Boolean {
+    val ws = webSocket
+    if (ws != null && isSocketOpen.get() && isSetupComplete.get()) {
+      return try {
+        ws.send(buildRealtimeAudioStreamEndFrameJson())
+      } catch (_: Exception) {
+        false
+      }
+    }
+    return false
+  }
+
+  /**
    * Stops microphone recording and releases [AudioRecord] and hardware audio effects safely.
    */
   fun stopMicrophoneStreaming() {
+    val hadPendingSpeech = hadMicSpeechInCurrentBurst.getAndSet(false)
+    val shouldFlushTurnEnd = isMicRecording.get() && !hasFlushedStreamEndForBurst.getAndSet(true)
     isMicRecording.set(false)
     try {
       micCaptureThread?.interrupt()
@@ -2245,13 +2336,18 @@ class GeminiLiveVoiceSession(
       } catch (_: Exception) {}
     }
 
+    val flushed = if (shouldFlushTurnEnd) sendAudioStreamEnd() else false
+
     updateState {
       it.copy(
         isMicRecording = false,
         micRmsLevel = 0f,
         interactionState =
-          if (isPlayingNativeAudio.get()) LiveVoiceInteractionState.SPEAKING
-          else LiveVoiceInteractionState.IDLE,
+          when {
+            isPlayingNativeAudio.get() -> LiveVoiceInteractionState.SPEAKING
+            flushed && hadPendingSpeech -> LiveVoiceInteractionState.PROCESSING
+            else -> LiveVoiceInteractionState.IDLE
+          },
       )
     }
   }
@@ -2261,6 +2357,10 @@ class GeminiLiveVoiceSession(
    */
   fun setMicMuted(muted: Boolean) {
     isMicMuted.set(muted)
+    if (muted && isMicRecording.get() && hadMicSpeechInCurrentBurst.getAndSet(false)) {
+      hasFlushedStreamEndForBurst.set(true)
+      sendAudioStreamEnd()
+    }
     updateState {
       it.copy(
         isMicMuted = muted,
@@ -2332,7 +2432,7 @@ class GeminiLiveVoiceSession(
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
             while (isPlaybackLoopRunning.get() && !Thread.currentThread().isInterrupted) {
               try {
-                val chunk = audioPlaybackQueue.poll(150, TimeUnit.MILLISECONDS)
+                val chunk = audioPlaybackQueue.poll(380, TimeUnit.MILLISECONDS)
                 if (chunk == null) {
                   if (isPlayingNativeAudio.compareAndSet(true, false)) {
                     onNativeAudioPlayingChanged(false)

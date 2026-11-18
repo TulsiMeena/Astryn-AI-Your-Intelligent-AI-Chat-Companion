@@ -27,7 +27,7 @@ public class ChatDao_Impl(
     this.__insertAdapterOfConversationEntity =
       object : EntityInsertAdapter<ConversationEntity>() {
         protected override fun createQuery(): String =
-          "INSERT OR IGNORE INTO `conversations` (`id`,`title`,`preview`,`createdAt`,`updatedAt`,`isPinned`,`isLiked`) VALUES (?,?,?,?,?,?,?)"
+          "INSERT OR IGNORE INTO `conversations` (`id`,`title`,`preview`,`createdAt`,`updatedAt`,`isPinned`,`isLiked`,`ownerUid`) VALUES (?,?,?,?,?,?,?,?)"
 
         protected override fun bind(statement: SQLiteStatement, entity: ConversationEntity) {
           statement.bindText(1, entity.id)
@@ -39,6 +39,7 @@ public class ChatDao_Impl(
           statement.bindLong(6, _tmp.toLong())
           val _tmp_1: Int = if (entity.isLiked) 1 else 0
           statement.bindLong(7, _tmp_1.toLong())
+          statement.bindText(8, entity.ownerUid)
         }
       }
     this.__insertAdapterOfMessageEntity =
@@ -103,6 +104,7 @@ public class ChatDao_Impl(
         val _columnIndexOfUpdatedAt: Int = getColumnIndexOrThrow(_stmt, "updatedAt")
         val _columnIndexOfIsPinned: Int = getColumnIndexOrThrow(_stmt, "isPinned")
         val _columnIndexOfIsLiked: Int = getColumnIndexOrThrow(_stmt, "isLiked")
+        val _columnIndexOfOwnerUid: Int = getColumnIndexOrThrow(_stmt, "ownerUid")
         val _result: MutableList<ConversationEntity> = mutableListOf()
         while (_stmt.step()) {
           val _item: ConversationEntity
@@ -115,6 +117,7 @@ public class ChatDao_Impl(
           val _tmpIsPinned: Boolean = _tmp != 0
           val _tmp_1: Int = _stmt.getLong(_columnIndexOfIsLiked).toInt()
           val _tmpIsLiked: Boolean = _tmp_1 != 0
+          val _tmpOwnerUid: String = _stmt.getText(_columnIndexOfOwnerUid)
           _item =
             ConversationEntity(
               _tmpId,
@@ -124,6 +127,7 @@ public class ChatDao_Impl(
               _tmpUpdatedAt,
               _tmpIsPinned,
               _tmpIsLiked,
+              _tmpOwnerUid,
             )
           _result.add(_item)
         }
@@ -146,6 +150,7 @@ public class ChatDao_Impl(
         val _columnIndexOfUpdatedAt: Int = getColumnIndexOrThrow(_stmt, "updatedAt")
         val _columnIndexOfIsPinned: Int = getColumnIndexOrThrow(_stmt, "isPinned")
         val _columnIndexOfIsLiked: Int = getColumnIndexOrThrow(_stmt, "isLiked")
+        val _columnIndexOfOwnerUid: Int = getColumnIndexOrThrow(_stmt, "ownerUid")
         val _result: MutableList<ConversationEntity> = mutableListOf()
         while (_stmt.step()) {
           val _item: ConversationEntity
@@ -158,6 +163,7 @@ public class ChatDao_Impl(
           val _tmpIsPinned: Boolean = _tmp != 0
           val _tmp_1: Int = _stmt.getLong(_columnIndexOfIsLiked).toInt()
           val _tmpIsLiked: Boolean = _tmp_1 != 0
+          val _tmpOwnerUid: String = _stmt.getText(_columnIndexOfOwnerUid)
           _item =
             ConversationEntity(
               _tmpId,
@@ -167,6 +173,7 @@ public class ChatDao_Impl(
               _tmpUpdatedAt,
               _tmpIsPinned,
               _tmpIsLiked,
+              _tmpOwnerUid,
             )
           _result.add(_item)
         }
@@ -191,6 +198,7 @@ public class ChatDao_Impl(
         val _columnIndexOfUpdatedAt: Int = getColumnIndexOrThrow(_stmt, "updatedAt")
         val _columnIndexOfIsPinned: Int = getColumnIndexOrThrow(_stmt, "isPinned")
         val _columnIndexOfIsLiked: Int = getColumnIndexOrThrow(_stmt, "isLiked")
+        val _columnIndexOfOwnerUid: Int = getColumnIndexOrThrow(_stmt, "ownerUid")
         val _result: ConversationEntity?
         if (_stmt.step()) {
           val _tmpId: String = _stmt.getText(_columnIndexOfId)
@@ -202,6 +210,7 @@ public class ChatDao_Impl(
           val _tmpIsPinned: Boolean = _tmp != 0
           val _tmp_1: Int = _stmt.getLong(_columnIndexOfIsLiked).toInt()
           val _tmpIsLiked: Boolean = _tmp_1 != 0
+          val _tmpOwnerUid: String = _stmt.getText(_columnIndexOfOwnerUid)
           _result =
             ConversationEntity(
               _tmpId,
@@ -211,6 +220,7 @@ public class ChatDao_Impl(
               _tmpUpdatedAt,
               _tmpIsPinned,
               _tmpIsLiked,
+              _tmpOwnerUid,
             )
         } else {
           _result = null
@@ -444,6 +454,7 @@ public class ChatDao_Impl(
         val _columnIndexOfUpdatedAt: Int = getColumnIndexOrThrow(_stmt, "updatedAt")
         val _columnIndexOfIsPinned: Int = getColumnIndexOrThrow(_stmt, "isPinned")
         val _columnIndexOfIsLiked: Int = getColumnIndexOrThrow(_stmt, "isLiked")
+        val _columnIndexOfOwnerUid: Int = getColumnIndexOrThrow(_stmt, "ownerUid")
         val _result: MutableList<ConversationEntity> = mutableListOf()
         while (_stmt.step()) {
           val _item: ConversationEntity
@@ -456,6 +467,7 @@ public class ChatDao_Impl(
           val _tmpIsPinned: Boolean = _tmp != 0
           val _tmp_1: Int = _stmt.getLong(_columnIndexOfIsLiked).toInt()
           val _tmpIsLiked: Boolean = _tmp_1 != 0
+          val _tmpOwnerUid: String = _stmt.getText(_columnIndexOfOwnerUid)
           _item =
             ConversationEntity(
               _tmpId,
@@ -465,6 +477,7 @@ public class ChatDao_Impl(
               _tmpUpdatedAt,
               _tmpIsPinned,
               _tmpIsLiked,
+              _tmpOwnerUid,
             )
           _result.add(_item)
         }
@@ -562,6 +575,44 @@ public class ChatDao_Impl(
         _stmt.bindLong(_argIndex, updatedAt)
         _argIndex = 3
         _stmt.bindText(_argIndex, id)
+        _stmt.step()
+      } finally {
+        _stmt.close()
+      }
+    }
+  }
+
+  public override suspend fun updateConversationOwner(
+    id: String,
+    ownerUid: String,
+  ) {
+    val _sql: String = "UPDATE conversations SET ownerUid = ? WHERE id = ?"
+    return performSuspending(__db, false, true) { _connection ->
+      val _stmt: SQLiteStatement = _connection.prepare(_sql)
+      try {
+        var _argIndex: Int = 1
+        _stmt.bindText(_argIndex, ownerUid)
+        _argIndex = 2
+        _stmt.bindText(_argIndex, id)
+        _stmt.step()
+      } finally {
+        _stmt.close()
+      }
+    }
+  }
+
+  public override suspend fun migrateConversationOwner(
+    oldOwnerUid: String,
+    newOwnerUid: String,
+  ) {
+    val _sql: String = "UPDATE conversations SET ownerUid = ? WHERE ownerUid = ?"
+    return performSuspending(__db, false, true) { _connection ->
+      val _stmt: SQLiteStatement = _connection.prepare(_sql)
+      try {
+        var _argIndex: Int = 1
+        _stmt.bindText(_argIndex, newOwnerUid)
+        _argIndex = 2
+        _stmt.bindText(_argIndex, oldOwnerUid)
         _stmt.step()
       } finally {
         _stmt.close()

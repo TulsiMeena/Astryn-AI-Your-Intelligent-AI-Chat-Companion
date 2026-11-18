@@ -125,29 +125,51 @@ class MainActivity : ComponentActivity() {
         "${uidPrefix}_${UUID.randomUUID()}"
       }
 
-      // Bind ChatHistoryRepository strictly to the authenticated user's UID
-      // so User B can never see User A's conversations.
+      // Bind ChatHistoryRepository, UserApiKeyManager, and Intelligence Engine strictly to the
+      // authenticated user's UID so User B can never see User A's conversations, API keys, or memory.
       LaunchedEffect(
         userPreferences.isLoggedIn,
         userPreferences.userUid,
         userPreferences.authIdToken,
+        userPreferences.userEmail,
       ) {
-        historyRepository.loadFromStorage()
         val effectiveUid =
-          if (userPreferences.isLoggedIn && userPreferences.userUid.isNotBlank()) {
-            userPreferences.userUid
+          if (isUserAuthenticated) {
+            userPreferences.userUid.trim()
           } else {
             "__signed_out__"
           }
+        val aliasUids =
+          if (isUserAuthenticated && userPreferences.userEmail.isNotBlank()) {
+            val fallback =
+              com.example.data.api.FirebaseRestAuthClient.fallbackUidForEmail(
+                userPreferences.userEmail
+              )
+            if (fallback.isNotBlank() && fallback != effectiveUid) setOf(fallback) else emptySet()
+          } else {
+            emptySet()
+          }
+
+        if (lastAuthenticatedUid.isNotBlank() && lastAuthenticatedUid != (if (isUserAuthenticated) effectiveUid else "")) {
+          com.example.data.api.AstrynIntelligenceEngine.onUserLogoutOrAccountSwitch(
+            lastAuthenticatedUid
+          )
+        }
+
+        apiKeyManager.bindToUser(if (isUserAuthenticated) effectiveUid else null)
+
         historyRepository.setActiveUser(
           uid = effectiveUid,
-          idToken = if (userPreferences.isLoggedIn) userPreferences.authIdToken else "",
+          idToken = if (isUserAuthenticated) userPreferences.authIdToken else "",
           context = applicationContext,
+          aliasUidsToMigrate = aliasUids,
         )
+
         if (!isUserAuthenticated) {
+          lastAuthenticatedUid = ""
           currentScreen = AppScreen.Auth(initialIsSignUp = false)
-        } else if (lastAuthenticatedUid != userPreferences.userUid) {
-          lastAuthenticatedUid = userPreferences.userUid
+        } else if (lastAuthenticatedUid != effectiveUid) {
+          lastAuthenticatedUid = effectiveUid
           currentScreen = AppScreen.Home
         }
       }
@@ -366,7 +388,7 @@ class MainActivity : ComponentActivity() {
 
                   is AppScreen.Chat -> {
                     ChatScreen(
-                      conversationId = screen.conversationId ?: "session_${System.currentTimeMillis()}",
+                      conversationId = screen.conversationId ?: createUserScopedConversationId(),
                       initialPrompt = screen.initialPrompt,
                       startWithLiveVoice = screen.startLiveVoice,
                       startWithVoiceMic = screen.startVoiceMic,

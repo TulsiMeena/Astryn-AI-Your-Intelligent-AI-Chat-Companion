@@ -1010,6 +1010,7 @@ class ChatViewModel(
               attachments = attachments,
               liveVoiceMood = liveVoiceMood,
               conversationId = targetConversationId,
+              precomputedIntentResult = contextMetadata?.intentResult,
               onGroundingMetadata = { citations, searchQueries ->
                 latestCitations = citations
                 latestSearchQueries = searchQueries
@@ -1178,14 +1179,15 @@ class ChatViewModel(
             val finalContent =
               if (rawAccumulated.isNotBlank() && liveVoiceMood == null) {
                 val intentCheck =
-                  AstrynIntelligenceEngine.analyzeIntentAndContext(
-                    prompt = prompt,
-                    conversationHistory = historyBeforePrompt,
-                    attachments = attachments,
-                    userUid = activePreferences.userUid,
-                    webSearchEnabled = activePreferences.webSearchEnabled,
-                    conversationId = targetConversationId,
-                  )
+                  contextMetadata?.intentResult
+                    ?: AstrynIntelligenceEngine.analyzeIntentAndContext(
+                      prompt = prompt,
+                      conversationHistory = historyBeforePrompt,
+                      attachments = attachments,
+                      userUid = activePreferences.userUid,
+                      webSearchEnabled = activePreferences.webSearchEnabled,
+                      conversationId = targetConversationId,
+                    )
                 AstrynIntelligenceEngine.verifyAndRepairResponse(
                   prompt = prompt,
                   rawResponse = rawAccumulated,

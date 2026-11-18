@@ -2468,6 +2468,12 @@ object AstrynIntelligenceEngine {
 
   fun shouldTriggerResearchGrounding(prompt: String): Boolean {
     val lower = normalizeTyposAndInformalHinglish(prompt).trim().lowercase(Locale.ROOT)
+      .replace("electric current", "")
+      .replace("alternating current", "")
+      .replace("direct current", "")
+      .replace("eddy current", "")
+      .replace("convection current", "")
+      .replace("ocean current", "")
     if (lower.length < 6) return false
     val groundingKeywords =
       listOf(
@@ -2494,32 +2500,79 @@ object AstrynIntelligenceEngine {
   ): String {
     val relevantMemories = retrieveRelevantMemories(userUid, prompt, maxItems = 3)
     val attRes = intentResult.attachmentResolution
-    val researchDetection =
-      AstrynResearchEngine.ResearchPlanner.detectResearchIntent(
-        prompt = prompt,
-        attachments = attRes.resolvedAttachments,
-        userUid = userUid,
-      )
+    val shouldCheckResearch =
+      intentResult.requiresWebGrounding ||
+        (intentResult.primaryIntent != PrimaryIntent.CASUAL_CONVERSATION &&
+          intentResult.primaryIntent != PrimaryIntent.SIMPLE_FACTUAL_OR_DIRECT)
     val researchDirective =
-      if (researchDetection.requiresExternalSearch ||
-        researchDetection.category != AstrynResearchEngine.ResearchIntentCategory.A_GENERAL_KNOWLEDGE
-      ) {
-        val plannedQueries =
-          AstrynResearchEngine.SearchCoordinator.generateSearchQueries(
+      if (shouldCheckResearch) {
+        val researchDetection =
+          AstrynResearchEngine.ResearchPlanner.detectResearchIntent(
             prompt = prompt,
-            detection = researchDetection,
             attachments = attRes.resolvedAttachments,
+            userUid = userUid,
           )
-        AstrynResearchEngine.buildResearchSystemDirective(
-          detection = researchDetection,
-          plannedQueries = plannedQueries,
-        )
+        if (
+          researchDetection.requiresExternalSearch ||
+            researchDetection.category != AstrynResearchEngine.ResearchIntentCategory.A_GENERAL_KNOWLEDGE
+        ) {
+          val plannedQueries =
+            AstrynResearchEngine.SearchCoordinator.generateSearchQueries(
+              prompt = prompt,
+              detection = researchDetection,
+              attachments = attRes.resolvedAttachments,
+            )
+          AstrynResearchEngine.buildResearchSystemDirective(
+            detection = researchDetection,
+            plannedQueries = plannedQueries,
+          )
+        } else {
+          ""
+        }
       } else {
         ""
       }
 
+    val personalDirective =
+      AstrynPersonalIntelligenceEngine.buildPersonalSystemDirective(
+        userId = userUid.orEmpty(),
+        query = prompt,
+      )
+    val knowledgeDirective =
+      AstrynPhase15Coordinator.buildKnowledgeContextDirective(
+        userUid = userUid,
+        prompt = prompt,
+      )
+    val p17Directive =
+      intentResult.phase17Analysis?.let { phase17 ->
+        AstrynAdaptiveIntelligenceEngines.AstrynPhase17Coordinator.buildConciseSystemDirective(phase17)
+      }.orEmpty()
+
+    val isLightweightNativeTurn =
+      (intentResult.primaryIntent == PrimaryIntent.CASUAL_CONVERSATION ||
+        intentResult.primaryIntent == PrimaryIntent.SIMPLE_FACTUAL_OR_DIRECT) &&
+        intentResult.inferredUserIntentSummary.isBlank() &&
+        attRes.resolvedAttachments.isEmpty() &&
+        intentResult.mathComputation == null &&
+        intentResult.userCorrections.isEmpty() &&
+        intentResult.implicitConstraints.isEmpty() &&
+        intentResult.resolvedReferences.isEmpty() &&
+        intentResult.extractedOptionTarget == null &&
+        !intentResult.unverifiedMemoryRecallRequested &&
+        !intentResult.isAmbiguousWithoutContext &&
+        relevantMemories.isEmpty() &&
+        researchDirective.isBlank() &&
+        personalDirective.isBlank() &&
+        knowledgeDirective.isBlank() &&
+        p17Directive.isBlank()
+
+    // Phase 18: Let Gemini answer simple/casual queries natively without unneeded coordination overhead.
+    if (isLightweightNativeTurn) {
+      return ""
+    }
+
     return buildString {
-      appendLine("[ASTRYN PHASE-2 INTELLIGENCE & REASONING DIRECTIVES]:")
+      appendLine("[ASTRYN CONTEXT & TOOL COORDINATION]:")
       appendLine("- Intent: ${intentResult.primaryIntent.name} | Reasoning: ${intentResult.reasoningMode.name} | Level: ${intentResult.expertiseLevel.name}")
       if (intentResult.inferredUserIntentSummary.isNotBlank()) {
         appendLine("- ${intentResult.inferredUserIntentSummary}")
@@ -2556,28 +2609,14 @@ object AstrynIntelligenceEngine {
       if (researchDirective.isNotBlank()) {
         appendLine(researchDirective)
       }
-      val personalDirective =
-        AstrynPersonalIntelligenceEngine.buildPersonalSystemDirective(
-          userId = userUid.orEmpty(),
-          query = prompt,
-        )
       if (personalDirective.isNotBlank()) {
         appendLine(personalDirective)
       }
-      val knowledgeDirective =
-        AstrynPhase15Coordinator.buildKnowledgeContextDirective(
-          userUid = userUid,
-          prompt = prompt,
-        )
       if (knowledgeDirective.isNotBlank()) {
         appendLine(knowledgeDirective)
       }
-      intentResult.phase17Analysis?.let { phase17 ->
-        val p17Directive =
-          AstrynAdaptiveIntelligenceEngines.AstrynPhase17Coordinator.buildConciseSystemDirective(phase17)
-        if (p17Directive.isNotBlank()) {
-          appendLine(p17Directive)
-        }
+      if (p17Directive.isNotBlank()) {
+        appendLine(p17Directive)
       }
       append(
         "- Output Quality: Match user language naturally. Answer directly without rigid templates, forced intros, or keyword parroting. Never expose internal chain-of-thought or fabricate citations.",
@@ -2615,11 +2654,16 @@ object AstrynIntelligenceEngine {
       repairs.add("Closed unclosed Markdown code block")
     }
 
-    // 3. Mathematical Verification Gate (concise verification note if the exact number was omitted)
+    // 3. Mathematical Verification Gate (only if Gemini omitted or mis-stated the verified result)
     val math = intentResult.mathComputation
     if (math != null && content.isNotBlank()) {
       val cleanAnswerNumber = math.formattedResult.removePrefix("₹").substringBefore(" ").trim()
-      if (!content.contains(cleanAnswerNumber)) {
+      val normalizedNumber = cleanAnswerNumber.replace(",", "")
+      val contentNoCommas = content.replace(",", "")
+      val alreadyContainsAnswer =
+        content.contains(cleanAnswerNumber) ||
+          (normalizedNumber.isNotEmpty() && contentNoCommas.contains(normalizedNumber))
+      if (!alreadyContainsAnswer) {
         val verifiedMathAppendix = buildString {
           appendLine()
           appendLine("**Verified Calculation:** ${math.expressionSummary} = **${math.formattedResult}** (${math.verificationNote})")

@@ -4414,6 +4414,8 @@ fun verifyFixedBehaviorHandlesEdgeCasesSafely() {
     return lower.contains("resume banao") ||
       lower.contains("cv banao") ||
       lower.contains("excel sheet banao") ||
+      lower.contains("expense sheet") ||
+      (lower.contains("csv") && (lower.contains("create") || lower.contains("generate") || lower.contains("sheet") || lower.contains("export"))) ||
       lower.contains("xlsx") ||
       lower.contains("spreadsheet") ||
       lower.contains("pdf bana do") ||
@@ -4482,7 +4484,7 @@ fun verifyFixedBehaviorHandlesEdgeCasesSafely() {
     }
 
     // 4. Spreadsheet Creation ("Is data ki Excel sheet banao", "XLSX", "CSV")
-    if (lower.contains("excel sheet") || lower.contains("spreadsheet") || lower.contains("xlsx")) {
+    if (lower.contains("excel sheet") || lower.contains("expense sheet") || lower.contains("spreadsheet") || lower.contains("xlsx") || (lower.contains("csv") && lower.contains("sheet"))) {
       val format = if (lower.contains("csv")) SpreadsheetFormat.CSV else SpreadsheetFormat.XLSX
       val defaultRows = listOf(
         listOf("Item", "Category", "Quantity", "Unit Price", "Total"),

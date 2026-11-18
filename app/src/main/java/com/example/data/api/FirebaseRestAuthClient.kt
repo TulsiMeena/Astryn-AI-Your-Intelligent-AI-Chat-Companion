@@ -32,6 +32,8 @@ data class FirebaseAuthSessionResult(
   val isEmailVerified: Boolean = true,
   val verificationEmailSent: Boolean = false,
   val statusMessage: String,
+  val refreshToken: String = "",
+  val fallbackAliasUid: String = "",
 )
 
 /**
@@ -41,6 +43,7 @@ data class EmailVerificationLookupResult(
   val isVerified: Boolean,
   val refreshedIdToken: String,
   val statusMessage: String,
+  val refreshToken: String = "",
 )
 
 /**
@@ -189,6 +192,121 @@ object FirebaseRestAuthClient {
 
   fun isCloudKeyConfigured(): Boolean = resolveConfiguredApiKey() != null
 
+  fun fallbackUidForEmail(email: String): String =
+    "uid_${email.trim().lowercase().hashCode().toUInt()}"
+
+  private fun computeFallbackAlias(canonicalUid: String, cleanEmail: String): String {
+    val fallback = fallbackUidForEmail(cleanEmail)
+    return if (canonicalUid.isNotBlank() && canonicalUid != fallback) fallback else ""
+  }
+
+  private fun rememberAccountSafely(
+    email: String,
+    displayName: String,
+    uid: String,
+    refreshToken: String,
+    provider: String,
+  ) {
+    try {
+      com.example.data.repository.UserPreferencesRepository
+        .getInstance()
+        .registerKnownAccount(
+          email = email,
+          displayName = displayName,
+          canonicalUid = uid,
+          refreshToken = refreshToken,
+          provider = provider,
+        )
+    } catch (_: Exception) {}
+  }
+
+  private fun refreshFirebaseIdToken(
+    apiKey: String,
+    refreshToken: String,
+  ): Triple<String, String, String>? {
+    val cleanRefresh = refreshToken.trim()
+    if (apiKey.isBlank() || cleanRefresh.isBlank()) return null
+    return try {
+      val payload =
+        JSONObject().apply {
+          put("grant_type", "refresh_token")
+          put("refresh_token", cleanRefresh)
+        }
+      val req =
+        Request.Builder()
+          .url("https://securetoken.googleapis.com/v1/token?key=$apiKey")
+          .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+          .build()
+      httpClient.newCall(req).execute().use { resp ->
+        if (!resp.isSuccessful) return null
+        val body = resp.body?.string().orEmpty()
+        if (body.isBlank()) return null
+        val json = JSONObject(body)
+        val newIdToken = json.optString("id_token", "").trim()
+        val newRefreshToken = json.optString("refresh_token", cleanRefresh).trim().ifBlank { cleanRefresh }
+        val userId = json.optString("user_id", "").trim()
+        if (newIdToken.isBlank() || userId.isBlank()) {
+          null
+        } else {
+          try {
+            com.example.data.repository.UserPreferencesRepository
+              .getInstance()
+              .updateAuthIdToken(newIdToken = newIdToken, newRefreshToken = newRefreshToken)
+          } catch (_: Exception) {}
+          Triple(newIdToken, newRefreshToken, userId)
+        }
+      }
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  private fun resolveActiveOrRefreshedToken(
+    uid: String,
+    currentIdToken: String,
+  ): String {
+    if (currentIdToken.isNotBlank()) return currentIdToken
+    val apiKey = resolveConfiguredApiKey() ?: return currentIdToken
+    val prefs =
+      try {
+        com.example.data.repository.UserPreferencesRepository.getInstance().preferencesFlow.value
+      } catch (_: Exception) {
+        return currentIdToken
+      }
+    val matchingRefresh =
+      when {
+        prefs.userUid == uid && prefs.authRefreshToken.isNotBlank() -> prefs.authRefreshToken
+        else ->
+          prefs.knownAccounts
+            .firstOrNull { it.canonicalUid == uid && it.refreshToken.isNotBlank() }
+            ?.refreshToken
+            .orEmpty()
+      }
+    if (matchingRefresh.isBlank()) return currentIdToken
+    return refreshFirebaseIdToken(apiKey, matchingRefresh)?.first ?: currentIdToken
+  }
+
+  private fun forceRefreshTokenForUid(uid: String): String {
+    val apiKey = resolveConfiguredApiKey() ?: return ""
+    val prefs =
+      try {
+        com.example.data.repository.UserPreferencesRepository.getInstance().preferencesFlow.value
+      } catch (_: Exception) {
+        return ""
+      }
+    val matchingRefresh =
+      when {
+        prefs.userUid == uid && prefs.authRefreshToken.isNotBlank() -> prefs.authRefreshToken
+        else ->
+          prefs.knownAccounts
+            .firstOrNull { it.canonicalUid == uid && it.refreshToken.isNotBlank() }
+            ?.refreshToken
+            .orEmpty()
+      }
+    if (matchingRefresh.isBlank()) return ""
+    return refreshFirebaseIdToken(apiKey, matchingRefresh)?.first.orEmpty()
+  }
+
   /**
    * Registers a new user account via Firebase Identity Toolkit `accounts:signUp`,
    * enforces Anti-Temp-Mail & Password Security policies, dispatches a Firebase verification email,
@@ -268,7 +386,16 @@ object FirebaseRestAuthClient {
 
           val json = JSONObject(bodyStr)
           val idToken = json.optString("idToken", "")
-          val localId = json.optString("localId", "uid_${cleanEmail.hashCode().toUInt()}")
+          val refreshToken = json.optString("refreshToken", "")
+          val localId = json.optString("localId", fallbackUidForEmail(cleanEmail))
+
+          rememberAccountSafely(
+            email = cleanEmail,
+            displayName = fullName.trim(),
+            uid = localId,
+            refreshToken = refreshToken,
+            provider = "Email",
+          )
 
           // 1. Update display name in Firebase Auth
           updateProfileDisplayName(apiKey = apiKey, idToken = idToken, displayName = fullName.trim())
@@ -311,6 +438,8 @@ object FirebaseRestAuthClient {
               isFirestoreSynced = firestoreSynced,
               isEmailVerified = false,
               verificationEmailSent = emailSentOk,
+              refreshToken = refreshToken,
+              fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
               statusMessage =
                 if (emailSentOk) {
                   "Account created in Firebase ($PROJECT_ID) & verification link sent to $cleanEmail!"
@@ -363,7 +492,8 @@ object FirebaseRestAuthClient {
           if (resp.isSuccessful && body.isNotBlank()) {
             val json = JSONObject(body)
             var activeIdToken = json.optString("idToken", "")
-            val localId = json.optString("localId", "uid_${cleanEmail.hashCode().toUInt()}")
+            var activeRefreshToken = json.optString("refreshToken", "")
+            val localId = json.optString("localId", fallbackUidForEmail(cleanEmail))
 
             // If signed in using the Google-derived password, update the password to the user's new password
             if (candidatePass != password && activeIdToken.isNotBlank()) {
@@ -382,15 +512,30 @@ object FirebaseRestAuthClient {
                 httpClient.newCall(updateReq).execute().use { upResp ->
                   val upBody = upResp.body?.string().orEmpty()
                   if (upResp.isSuccessful && upBody.isNotBlank()) {
-                    val refreshed = JSONObject(upBody).optString("idToken", "")
+                    val upJson = JSONObject(upBody)
+                    val refreshed = upJson.optString("idToken", "")
+                    val refreshedRt = upJson.optString("refreshToken", "")
                     if (refreshed.isNotBlank()) activeIdToken = refreshed
+                    if (refreshedRt.isNotBlank()) activeRefreshToken = refreshedRt
                   }
                 }
               } catch (_: Exception) {}
             }
 
+            rememberAccountSafely(
+              email = cleanEmail,
+              displayName = fullName,
+              uid = localId,
+              refreshToken = activeRefreshToken,
+              provider = "Email",
+            )
+
+            val isAlreadyVerified =
+              lookupEmailVerifiedInFirebase(apiKey = apiKey, idToken = activeIdToken)
             updateProfileDisplayName(apiKey = apiKey, idToken = activeIdToken, displayName = fullName)
-            sendEmailVerificationLink(apiKey = apiKey, idToken = activeIdToken)
+            if (!isAlreadyVerified) {
+              sendEmailVerificationLink(apiKey = apiKey, idToken = activeIdToken)
+            }
 
             val firestoreSynced =
               syncProfileToFirestore(
@@ -400,7 +545,7 @@ object FirebaseRestAuthClient {
                 email = cleanEmail,
                 roleBadge = roleBadge,
                 provider = "Email",
-                emailVerified = false,
+                emailVerified = isAlreadyVerified,
               )
             syncProfileToRealtimeDb(
               uid = localId,
@@ -409,7 +554,7 @@ object FirebaseRestAuthClient {
               email = cleanEmail,
               roleBadge = roleBadge,
               provider = "Email",
-              emailVerified = false,
+              emailVerified = isAlreadyVerified,
             )
 
             return FirebaseAuthSessionResult(
@@ -420,10 +565,16 @@ object FirebaseRestAuthClient {
               idToken = activeIdToken,
               isCloudSynced = true,
               isFirestoreSynced = firestoreSynced,
-              isEmailVerified = false,
-              verificationEmailSent = true,
+              isEmailVerified = isAlreadyVerified,
+              verificationEmailSent = !isAlreadyVerified,
+              refreshToken = activeRefreshToken,
+              fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
               statusMessage =
-                "Verification link sent to $cleanEmail via Firebase ($PROJECT_ID)! Click the link in your email to enter.",
+                if (isAlreadyVerified) {
+                  "Existing account verified & signed in ($PROJECT_ID) ✓"
+                } else {
+                  "Verification link sent to $cleanEmail via Firebase ($PROJECT_ID)! Click the link in your email to enter."
+                },
             )
           }
         }
@@ -478,29 +629,35 @@ object FirebaseRestAuthClient {
         httpClient.newCall(signInRequest).execute().use { response ->
           val bodyStr = response.body?.string().orEmpty()
           if (!response.isSuccessful) {
-            // If this email was originally created via 1-Tap Google Sign-In, reconcile the password seamlessly
             if (
               bodyStr.contains("INVALID_LOGIN_CREDENTIALS", ignoreCase = true) ||
                 bodyStr.contains("INVALID_PASSWORD", ignoreCase = true)
             ) {
-              val reconciled =
-                reconcileExistingEmailOnSignUp(
-                  apiKey = apiKey,
-                  cleanEmail = cleanEmail,
-                  password = password,
-                  fullName =
-                    fallbackName.trim().ifBlank {
-                      cleanEmail.substringBefore("@").replace(".", " ").replaceFirstChar { it.uppercase() }
-                    },
-                  roleBadge = fallbackRoleBadge.ifBlank { "Developer" },
-                )
-              if (reconciled != null) {
-                val isVerifiedNow =
-                  lookupEmailVerifiedInFirebase(apiKey = apiKey, idToken = reconciled.idToken)
-                return@withContext Result.success(
-                  reconciled.copy(
-                    isEmailVerified = isVerifiedNow,
-                    verificationEmailSent = !isVerifiedNow,
+              // Check read-only whether this email was created via Continue with Google without modifying its password
+              val derivedGooglePass = "GAuth!9#${cleanEmail.hashCode().toUInt()}Xz"
+              var isGoogleLinkedAccount = false
+              try {
+                val probePayload =
+                  JSONObject().apply {
+                    put("email", cleanEmail)
+                    put("password", derivedGooglePass)
+                    put("returnSecureToken", false)
+                  }
+                val probeReq =
+                  Request.Builder()
+                    .url(
+                      "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=$apiKey"
+                    )
+                    .post(probePayload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+                httpClient.newCall(probeReq).execute().use { probeResp ->
+                  isGoogleLinkedAccount = probeResp.isSuccessful
+                }
+              } catch (_: Exception) {}
+              if (isGoogleLinkedAccount) {
+                return@withContext Result.failure(
+                  IllegalStateException(
+                    "This email is signed in with Google. Tap 'Continue with Google' below, or use 'Forgot Password?' to set an email password."
                   )
                 )
               }
@@ -511,7 +668,8 @@ object FirebaseRestAuthClient {
 
           val json = JSONObject(bodyStr)
           val idToken = json.optString("idToken", "")
-          val localId = json.optString("localId", "uid_${cleanEmail.hashCode().toUInt()}")
+          val refreshToken = json.optString("refreshToken", "")
+          val localId = json.optString("localId", fallbackUidForEmail(cleanEmail))
           val serverName = json.optString("displayName", "").trim()
 
           // Check whether the user has clicked the verification link in their email
@@ -531,6 +689,14 @@ object FirebaseRestAuthClient {
                 }
               }
           val finalRole = fsRole ?: rtdbRole ?: fallbackRoleBadge.ifBlank { "AI Pro Member" }
+
+          rememberAccountSafely(
+            email = cleanEmail,
+            displayName = finalName,
+            uid = localId,
+            refreshToken = refreshToken,
+            provider = "Email",
+          )
 
           if (!isVerifiedInFirebase) {
             // Re-dispatch verification link automatically so the user can verify right away
@@ -568,6 +734,8 @@ object FirebaseRestAuthClient {
               isFirestoreSynced = firestoreSynced,
               isEmailVerified = isVerifiedInFirebase,
               verificationEmailSent = !isVerifiedInFirebase,
+              refreshToken = refreshToken,
+              fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
               statusMessage =
                 if (isVerifiedInFirebase) {
                   "Authenticated & private chat vault loaded ($PROJECT_ID) ✓"
@@ -628,9 +796,17 @@ object FirebaseRestAuthClient {
             .joinToString(" ") { part -> part.replaceFirstChar { it.uppercase() } }
             .ifBlank { "Google User" }
         }
-      val finalRoleBadge = roleBadge.trim().ifBlank { "Developer" }
+      val finalRoleBadge = roleBadge.trim().ifBlank { "Pro Member" }
       val derivedAccountPass = "GAuth!9#${cleanEmail.hashCode().toUInt()}Xz"
       val apiKey = resolveConfiguredApiKeyWithAutoDiscovery()
+      val prefsRepo =
+        try {
+          com.example.data.repository.UserPreferencesRepository.getInstance()
+        } catch (_: Exception) {
+          null
+        }
+      val storedRefreshToken = prefsRepo?.getRefreshTokenForEmail(cleanEmail).orEmpty()
+      val storedCanonicalUid = prefsRepo?.getCanonicalUidForEmail(cleanEmail).orEmpty()
 
       if (apiKey != null) {
         // 1. If a Google OAuth ID Token is provided, exchange it via Firebase `accounts:signInWithIdp`
@@ -654,9 +830,12 @@ object FirebaseRestAuthClient {
               if (response.isSuccessful) {
                 val json = JSONObject(bodyStr)
                 val idToken = json.optString("idToken", "")
-                val localId = json.optString("localId", "uid_${cleanEmail.hashCode().toUInt()}")
+                val refreshToken = json.optString("refreshToken", "")
+                val localId = json.optString("localId", storedCanonicalUid.ifBlank { fallbackUidForEmail(cleanEmail) })
                 val resolvedEmail = json.optString("email", cleanEmail).ifBlank { cleanEmail }
                 val resolvedName = json.optString("displayName", cleanName).ifBlank { cleanName }
+
+                rememberAccountSafely(resolvedEmail, resolvedName, localId, refreshToken, "Google")
 
                 val firestoreSynced =
                   syncProfileToFirestore(
@@ -684,6 +863,8 @@ object FirebaseRestAuthClient {
                     idToken = idToken,
                     isCloudSynced = true,
                     isFirestoreSynced = firestoreSynced,
+                    refreshToken = refreshToken,
+                    fallbackAliasUid = computeFallbackAlias(localId, resolvedEmail),
                     statusMessage = "Signed in with Google OAuth & synced to Firestore ($PROJECT_ID) ✓",
                   )
                 )
@@ -694,7 +875,52 @@ object FirebaseRestAuthClient {
           }
         }
 
-        // 2. Try signing in to existing Google-linked Firebase Auth account
+        // 2. If this account already has a saved Firebase refreshToken on this device, exchange it
+        // so we preserve the exact canonical Firebase UID across Email & Google logins!
+        if (storedRefreshToken.isNotBlank()) {
+          val refreshed = refreshFirebaseIdToken(apiKey = apiKey, refreshToken = storedRefreshToken)
+          if (refreshed != null) {
+            val (freshIdToken, nextRefreshToken, refreshedUid) = refreshed
+            val (fsName, fsRole) = fetchProfileFromFirestore(uid = refreshedUid, idToken = freshIdToken)
+            val effectiveName = fsName ?: cleanName
+            val effectiveRole = fsRole ?: finalRoleBadge
+            rememberAccountSafely(cleanEmail, effectiveName, refreshedUid, nextRefreshToken, "Google")
+
+            val firestoreSynced =
+              syncProfileToFirestore(
+                uid = refreshedUid,
+                idToken = freshIdToken,
+                name = effectiveName,
+                email = cleanEmail,
+                roleBadge = effectiveRole,
+                provider = "Google",
+              )
+            syncProfileToRealtimeDb(
+              uid = refreshedUid,
+              idToken = freshIdToken,
+              name = effectiveName,
+              email = cleanEmail,
+              roleBadge = effectiveRole,
+              provider = "Google",
+            )
+            return@withContext Result.success(
+              FirebaseAuthSessionResult(
+                uid = refreshedUid,
+                email = cleanEmail,
+                displayName = effectiveName,
+                roleBadge = effectiveRole,
+                idToken = freshIdToken,
+                isCloudSynced = true,
+                isFirestoreSynced = firestoreSynced,
+                refreshToken = nextRefreshToken,
+                fallbackAliasUid = computeFallbackAlias(refreshedUid, cleanEmail),
+                statusMessage = "Signed in with Google & loaded private Firestore vault ($PROJECT_ID) ✓",
+              )
+            )
+          }
+        }
+
+        // 3. Try signing in to existing Google-linked Firebase Auth account
         try {
           val signInPayload =
             JSONObject().apply {
@@ -713,10 +939,12 @@ object FirebaseRestAuthClient {
             if (response.isSuccessful) {
               val json = JSONObject(bodyStr)
               val idToken = json.optString("idToken", "")
-              val localId = json.optString("localId", "uid_${cleanEmail.hashCode().toUInt()}")
+              val refreshToken = json.optString("refreshToken", "")
+              val localId = json.optString("localId", storedCanonicalUid.ifBlank { fallbackUidForEmail(cleanEmail) })
               val (fsName, fsRole) = fetchProfileFromFirestore(uid = localId, idToken = idToken)
               val effectiveName = fsName ?: cleanName
               val effectiveRole = fsRole ?: finalRoleBadge
+              rememberAccountSafely(cleanEmail, effectiveName, localId, refreshToken, "Google")
 
               val firestoreSynced =
                 syncProfileToFirestore(
@@ -744,6 +972,8 @@ object FirebaseRestAuthClient {
                   idToken = idToken,
                   isCloudSynced = true,
                   isFirestoreSynced = firestoreSynced,
+                  refreshToken = refreshToken,
+                  fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
                   statusMessage = "Signed in with Google & loaded private Firestore vault ($PROJECT_ID) ✓",
                 )
               )
@@ -753,7 +983,7 @@ object FirebaseRestAuthClient {
           // Proceed to sign-up check
         }
 
-        // 3. Register new Google-linked account in Firebase Auth (`accounts:signUp`)
+        // 4. Register new Google-linked account in Firebase Auth (`accounts:signUp`)
         try {
           val signUpPayload =
             JSONObject().apply {
@@ -772,8 +1002,10 @@ object FirebaseRestAuthClient {
             if (response.isSuccessful) {
               val json = JSONObject(bodyStr)
               val idToken = json.optString("idToken", "")
-              val localId = json.optString("localId", "uid_${cleanEmail.hashCode().toUInt()}")
+              val refreshToken = json.optString("refreshToken", "")
+              val localId = json.optString("localId", storedCanonicalUid.ifBlank { fallbackUidForEmail(cleanEmail) })
               updateProfileDisplayName(apiKey = apiKey, idToken = idToken, displayName = cleanName)
+              rememberAccountSafely(cleanEmail, cleanName, localId, refreshToken, "Google")
 
               val firestoreSynced =
                 syncProfileToFirestore(
@@ -801,6 +1033,8 @@ object FirebaseRestAuthClient {
                   idToken = idToken,
                   isCloudSynced = true,
                   isFirestoreSynced = firestoreSynced,
+                  refreshToken = refreshToken,
+                  fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
                   statusMessage = "Google Account registered in Firebase Auth & Firestore ($PROJECT_ID) ✓",
                 )
               )
@@ -811,11 +1045,12 @@ object FirebaseRestAuthClient {
         }
       }
 
-      // 4. Sync verified Google identity directly to Cloud Firestore & Realtime Database (`users/{uid}`)
-      val uid = "uid_${cleanEmail.hashCode().toUInt()}"
+      // 5. Offline / fallback sync preserving canonical UID if previously known for this email
+      val uid = storedCanonicalUid.ifBlank { fallbackUidForEmail(cleanEmail) }
       val (existingFsName, existingFsRole) = fetchProfileFromFirestore(uid = uid, idToken = "")
       val effectiveName = existingFsName ?: cleanName
       val effectiveRole = existingFsRole ?: finalRoleBadge
+      rememberAccountSafely(cleanEmail, effectiveName, uid, storedRefreshToken, "Google")
 
       val firestoreSynced =
         syncProfileToFirestore(
@@ -843,6 +1078,8 @@ object FirebaseRestAuthClient {
           idToken = "",
           isCloudSynced = firestoreSynced,
           isFirestoreSynced = firestoreSynced,
+          refreshToken = storedRefreshToken,
+          fallbackAliasUid = computeFallbackAlias(uid, cleanEmail),
           statusMessage = "Signed in with Google as $effectiveName ($PROJECT_ID) ✓",
         )
       )
@@ -934,6 +1171,8 @@ object FirebaseRestAuthClient {
           return@withContext
         }
 
+      var activeToken = resolveActiveOrRefreshedToken(uid = uid, currentIdToken = idToken)
+
       // 1. Sync to Cloud Firestore (`users/{uid}/conversations/{convId}`)
       try {
         val fieldsObj =
@@ -953,10 +1192,23 @@ object FirebaseRestAuthClient {
           Request.Builder()
             .url("$FIRESTORE_BASE_URL/users/$uid/conversations/${conversation.id}")
             .patch(docPayload.toString().toRequestBody(JSON_MEDIA_TYPE))
-        if (idToken.isNotBlank()) {
-          reqBuilder.header("Authorization", "Bearer $idToken")
+        if (activeToken.isNotBlank()) {
+          reqBuilder.header("Authorization", "Bearer $activeToken")
         }
-        httpClient.newCall(reqBuilder.build()).execute().close()
+        val fsCode = httpClient.newCall(reqBuilder.build()).execute().use { it.code }
+        if (fsCode == 401 || fsCode == 403) {
+          val refreshed = forceRefreshTokenForUid(uid)
+          if (refreshed.isNotBlank() && refreshed != activeToken) {
+            activeToken = refreshed
+            val retryReq =
+              Request.Builder()
+                .url("$FIRESTORE_BASE_URL/users/$uid/conversations/${conversation.id}")
+                .patch(docPayload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .header("Authorization", "Bearer $activeToken")
+                .build()
+            httpClient.newCall(retryReq).execute().close()
+          }
+        }
       } catch (_: Exception) {}
 
       // 2. Sync to Realtime Database (`/users/{uid}/conversations/{convId}.json`)
@@ -973,13 +1225,25 @@ object FirebaseRestAuthClient {
             put("isLiked", conversation.isLiked)
             put("messagesJson", serializedMessages)
           }
-        val authParam = if (idToken.isNotBlank()) "?auth=$idToken" else ""
+        val authParam = if (activeToken.isNotBlank()) "?auth=$activeToken" else ""
         val req =
           Request.Builder()
             .url("$DATABASE_URL/users/$uid/conversations/${conversation.id}.json$authParam")
             .put(rtdbObj.toString().toRequestBody(JSON_MEDIA_TYPE))
             .build()
-        httpClient.newCall(req).execute().close()
+        val rtdbCode = httpClient.newCall(req).execute().use { it.code }
+        if (rtdbCode == 401 || rtdbCode == 403) {
+          val refreshed = forceRefreshTokenForUid(uid)
+          if (refreshed.isNotBlank()) {
+            activeToken = refreshed
+            val retryReq =
+              Request.Builder()
+                .url("$DATABASE_URL/users/$uid/conversations/${conversation.id}.json?auth=$activeToken")
+                .put(rtdbObj.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            httpClient.newCall(retryReq).execute().close()
+          }
+        }
       } catch (_: Exception) {}
     }
 
@@ -993,19 +1257,20 @@ object FirebaseRestAuthClient {
   ) =
     withContext(Dispatchers.IO) {
       if (uid.isBlank() || conversationId.isBlank()) return@withContext
+      val activeToken = resolveActiveOrRefreshedToken(uid = uid, currentIdToken = idToken)
       try {
         val fsReq =
           Request.Builder()
             .url("$FIRESTORE_BASE_URL/users/$uid/conversations/$conversationId")
             .delete()
-        if (idToken.isNotBlank()) {
-          fsReq.header("Authorization", "Bearer $idToken")
+        if (activeToken.isNotBlank()) {
+          fsReq.header("Authorization", "Bearer $activeToken")
         }
         httpClient.newCall(fsReq.build()).execute().close()
       } catch (_: Exception) {}
 
       try {
-        val authParam = if (idToken.isNotBlank()) "?auth=$idToken" else ""
+        val authParam = if (activeToken.isNotBlank()) "?auth=$activeToken" else ""
         val rtdbReq =
           Request.Builder()
             .url("$DATABASE_URL/users/$uid/conversations/$conversationId.json$authParam")
@@ -1025,15 +1290,26 @@ object FirebaseRestAuthClient {
   ): List<CloudSyncedConversation> =
     withContext(Dispatchers.IO) {
       if (uid.isBlank()) return@withContext emptyList()
+      var activeToken = resolveActiveOrRefreshedToken(uid = uid, currentIdToken = idToken)
 
       // Try Cloud Firestore first (`users/{uid}/conversations`)
-      val fromFirestore = fetchConversationsFromFirestore(uid, idToken)
+      val fromFirestore = fetchConversationsFromFirestore(uid, activeToken)
       if (fromFirestore.isNotEmpty()) {
         return@withContext fromFirestore
       }
 
+      // If token expired, refresh once and retry Cloud Firestore
+      val refreshed = forceRefreshTokenForUid(uid)
+      if (refreshed.isNotBlank() && refreshed != activeToken) {
+        activeToken = refreshed
+        val retriedFs = fetchConversationsFromFirestore(uid, activeToken)
+        if (retriedFs.isNotEmpty()) {
+          return@withContext retriedFs
+        }
+      }
+
       // Fallback to Realtime Database (`/users/{uid}/conversations.json`)
-      fetchConversationsFromRealtimeDb(uid, idToken)
+      fetchConversationsFromRealtimeDb(uid, activeToken)
     }
 
   private fun fetchConversationsFromFirestore(
@@ -1090,6 +1366,7 @@ object FirebaseRestAuthClient {
                     updatedAt = updatedAt,
                     isPinned = isPinned,
                     isLiked = isLiked,
+                    ownerUid = uid,
                   ),
                 messages = messages,
               )
@@ -1146,6 +1423,7 @@ object FirebaseRestAuthClient {
                     updatedAt = updatedAt,
                     isPinned = isPinned,
                     isLiked = isLiked,
+                    ownerUid = uid,
                   ),
                 messages = messages,
               )
@@ -1204,19 +1482,25 @@ object FirebaseRestAuthClient {
     return sendEmailVerificationLinkWithResult(apiKey, idToken).isSuccess
   }
 
+  internal fun buildVerificationEmailPayloadJson(idToken: String): JSONObject {
+    return JSONObject().apply {
+      put("requestType", "VERIFY_EMAIL")
+      put("idToken", idToken)
+      put("continueUrl", "https://$AUTH_DOMAIN/?app=Astryn+AI&verified=1")
+      put("canHandleCodeInApp", false)
+    }
+  }
+
   private fun sendEmailVerificationLinkWithResult(apiKey: String, idToken: String): Result<Unit> {
     if (apiKey.isBlank() || idToken.isBlank()) {
       return Result.failure(IllegalStateException("Missing Firebase API key or session token."))
     }
     return try {
-      val payload =
-        JSONObject().apply {
-          put("requestType", "VERIFY_EMAIL")
-          put("idToken", idToken)
-        }
+      val payload = buildVerificationEmailPayloadJson(idToken)
       val req =
         Request.Builder()
           .url("https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=$apiKey")
+          .header("X-Firebase-Locale", "en")
           .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
           .build()
       httpClient.newCall(req).execute().use { resp ->
@@ -1284,6 +1568,7 @@ object FirebaseRestAuthClient {
 
       try {
         var activeToken = idToken
+        var capturedRefreshToken = ""
         // Refresh token if password is provided so Firebase returns the freshest verification state
         if (password.isNotBlank() && cleanEmail.isNotBlank()) {
           try {
@@ -1301,9 +1586,14 @@ object FirebaseRestAuthClient {
             httpClient.newCall(signInReq).execute().use { resp ->
               val body = resp.body?.string().orEmpty()
               if (resp.isSuccessful && body.isNotBlank()) {
-                val fresh = JSONObject(body).optString("idToken", "")
+                val signInJson = JSONObject(body)
+                val fresh = signInJson.optString("idToken", "")
+                val rt = signInJson.optString("refreshToken", "")
                 if (fresh.isNotBlank()) {
                   activeToken = fresh
+                }
+                if (rt.isNotBlank()) {
+                  capturedRefreshToken = rt
                 }
               }
             }
@@ -1316,6 +1606,7 @@ object FirebaseRestAuthClient {
             name.trim().ifBlank {
               cleanEmail.substringBefore("@").replace(".", " ").replaceFirstChar { it.uppercase() }
             }
+          rememberAccountSafely(cleanEmail, resolvedName, resolvedUid, capturedRefreshToken, "Email")
           syncProfileToFirestore(
             uid = resolvedUid,
             idToken = activeToken,
@@ -1338,6 +1629,7 @@ object FirebaseRestAuthClient {
             EmailVerificationLookupResult(
               isVerified = true,
               refreshedIdToken = activeToken,
+              refreshToken = capturedRefreshToken,
               statusMessage = "Email $cleanEmail verified in Firebase ($PROJECT_ID) ✓ Welcome!",
             )
           )
@@ -1346,8 +1638,9 @@ object FirebaseRestAuthClient {
             EmailVerificationLookupResult(
               isVerified = false,
               refreshedIdToken = activeToken,
+              refreshToken = capturedRefreshToken,
               statusMessage =
-                "Email abhi tak verify nahi hua hai! Kripya apne $cleanEmail inbox (ya Spam folder) mein Firebase verification link par click karein, fir 'Verify & Enter App' dabayein.",
+                "Email abhi tak verify nahi hua hai! Kripya apne $cleanEmail inbox (ya Spam folder) mein Astryn AI verification link par click karein, fir 'Verify & Enter App' dabayein.",
             )
           )
         }

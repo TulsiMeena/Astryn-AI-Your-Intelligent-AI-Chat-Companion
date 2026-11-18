@@ -3,6 +3,8 @@ package com.example.ui.screens.chat
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -120,9 +122,14 @@ fun LiveGirlfriendVoiceCallScreen(
   onStopFallbackTts: () -> Unit = {},
   onSpeakFallbackTts: (String, LiveGirlfriendMood) -> Unit = { _, _ -> },
   onNativeAudioActiveChanged: (Boolean) -> Unit = {},
+  autoListenTrigger: Int = 0,
+  externalVoiceFeedback: String? = null,
+  onClearExternalVoiceFeedback: () -> Unit = {},
+  onUserTranscriptFromWs: (String) -> Unit = {},
 ) {
   val context = LocalContext.current
   val reducedMotion = LocalReducedMotion.current
+  val mainHandler = remember { Handler(Looper.getMainLooper()) }
   var callSeconds by remember { mutableIntStateOf(0) }
   var permissionFeedbackMessage by remember { mutableStateOf<String?>(null) }
 
@@ -135,6 +142,9 @@ fun LiveGirlfriendVoiceCallScreen(
           onStopFallbackTts()
         }
       },
+      onUserTranscriptDelta = { userTranscript ->
+        onUserTranscriptFromWs(userTranscript)
+      },
       onLiveTurnCompleteWithAudioFlag = { completedText, playedNativeAudio ->
         if (!playedNativeAudio && completedText.isNotBlank()) {
           onSpeakFallbackTts(completedText, selectedMood)
@@ -145,6 +155,13 @@ fun LiveGirlfriendVoiceCallScreen(
       },
       onMoodChangedByTool = { toolMood ->
         onSelectMood(toolMood)
+      },
+      onFallbackToDeviceVoiceRequested = {
+        mainHandler.post {
+          if (!isListeningVoice) {
+            onToggleTalkMic()
+          }
+        }
       },
     )
   }
@@ -196,6 +213,7 @@ fun LiveGirlfriendVoiceCallScreen(
     }
 
   val handleToggleLiveMicrophone: () -> Unit = {
+    onClearExternalVoiceFeedback()
     // Barge-in: if Aanya JARVIS is speaking, interrupt playback immediately so user can command
     if (isEffectiveSpeaking) {
       liveWsSession.interruptPlayback()
@@ -235,6 +253,31 @@ fun LiveGirlfriendVoiceCallScreen(
           audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         } catch (_: Exception) {
           permissionFeedbackMessage = "माइक परमिशन शुरू नहीं हो सकी।"
+        }
+      }
+    }
+  }
+
+  // Hands-free auto-listen trigger after greeting or completed AI speech turn
+  LaunchedEffect(autoListenTrigger) {
+    if (
+      autoListenTrigger > 0 &&
+        autoHandsFree &&
+        !liveSnap.isMicRecording &&
+        !isListeningVoice &&
+        !liveSnap.isMicMuted &&
+        !isEffectiveSpeaking &&
+        !isEffectiveProcessing
+    ) {
+      val hasAudioPerm =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+          PackageManager.PERMISSION_GRANTED
+      if (hasAudioPerm) {
+        onClearExternalVoiceFeedback()
+        if (liveWsSession.isLiveWebSocketReady()) {
+          liveWsSession.startMicrophoneStreaming(context)
+        } else {
+          onToggleTalkMic()
         }
       }
     }
@@ -483,15 +526,25 @@ fun LiveGirlfriendVoiceCallScreen(
                 Modifier.size(7.dp)
                   .clip(CircleShape)
                   .background(
-                    if (liveSnap.connectionState == LiveConnectionState.CONNECTED_READY) {
-                      Color(0xFF10B981)
-                    } else {
-                      primaryAuraColor
+                    when {
+                      liveSnap.connectionState == LiveConnectionState.CONNECTED_READY &&
+                        liveSnap.isSetupComplete -> Color(0xFF10B981)
+                      liveSnap.isUsingFallbackVoiceEngine -> Color(0xFF38BDF8)
+                      else -> primaryAuraColor
                     }
                   )
             )
+            val statusModeLabel =
+              when {
+                liveSnap.connectionState == LiveConnectionState.CONNECTED_READY &&
+                  liveSnap.isSetupComplete -> "JARVIS LIVE"
+                liveSnap.connectionState == LiveConnectionState.CONNECTING ||
+                  liveSnap.connectionState == LiveConnectionState.HANDSHAKING ||
+                  liveSnap.connectionState == LiveConnectionState.RECONNECTING -> "JARVIS SYNC"
+                else -> "JARVIS VOICE"
+              }
             Text(
-              text = "JARVIS OS • $formattedDuration",
+              text = "$statusModeLabel • $formattedDuration",
               style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
               fontWeight = FontWeight.Bold,
               color = Color(0xFFE0F2FE),
@@ -622,7 +675,10 @@ fun LiveGirlfriendVoiceCallScreen(
           }
         }
 
-        if (!permissionFeedbackMessage.isNullOrBlank()) {
+        val activeBannerMessage =
+          permissionFeedbackMessage?.takeIf { it.isNotBlank() }
+            ?: externalVoiceFeedback?.takeIf { it.isNotBlank() }
+        if (!activeBannerMessage.isNullOrBlank()) {
           Row(
             modifier =
               Modifier.fillMaxWidth()
@@ -641,7 +697,7 @@ fun LiveGirlfriendVoiceCallScreen(
               modifier = Modifier.size(16.dp),
             )
             Text(
-              text = permissionFeedbackMessage.orEmpty(),
+              text = activeBannerMessage,
               style = MaterialTheme.typography.labelSmall,
               color = Color.White,
               modifier = Modifier.weight(1f),

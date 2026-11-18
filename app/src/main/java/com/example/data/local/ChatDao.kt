@@ -46,6 +46,12 @@ interface ChatDao {
   @Query("UPDATE conversations SET isLiked = :isLiked, updatedAt = :updatedAt WHERE id = :id")
   suspend fun updateConversationLiked(id: String, isLiked: Boolean, updatedAt: Long)
 
+  @Query("UPDATE conversations SET ownerUid = :ownerUid WHERE id = :id")
+  suspend fun updateConversationOwner(id: String, ownerUid: String)
+
+  @Query("UPDATE conversations SET ownerUid = :newOwnerUid WHERE ownerUid = :oldOwnerUid")
+  suspend fun migrateConversationOwner(oldOwnerUid: String, newOwnerUid: String)
+
   @Query("DELETE FROM conversations WHERE id = :id")
   suspend fun deleteConversationById(id: String)
 

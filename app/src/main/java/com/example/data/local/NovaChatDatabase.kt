@@ -13,7 +13,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  */
 @Database(
   entities = [ConversationEntity::class, MessageEntity::class],
-  version = 4,
+  version = 5,
   exportSchema = false,
 )
 abstract class NovaChatDatabase : RoomDatabase() {
@@ -57,6 +57,17 @@ abstract class NovaChatDatabase : RoomDatabase() {
         }
       }
 
+    /**
+     * Non-destructive migration from schema v4 to v5 adding per-user ownerUid column to conversations
+     * so account history ownership survives across restarts and logins without SharedPreferences loss.
+     */
+    val MIGRATION_4_5: Migration =
+      object : Migration(4, 5) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+          db.execSQL("ALTER TABLE conversations ADD COLUMN ownerUid TEXT NOT NULL DEFAULT ''")
+        }
+      }
+
     @Volatile private var INSTANCE: NovaChatDatabase? = null
 
     fun getInstance(context: Context): NovaChatDatabase {
@@ -68,7 +79,7 @@ abstract class NovaChatDatabase : RoomDatabase() {
                 NovaChatDatabase::class.java,
                 DATABASE_NAME,
               )
-              .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+              .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
               .fallbackToDestructiveMigration(dropAllTables = true)
               .build()
               .also { INSTANCE = it }

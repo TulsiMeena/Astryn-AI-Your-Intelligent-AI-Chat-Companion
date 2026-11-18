@@ -1159,7 +1159,6 @@ object AstrynAdaptiveIntelligenceEngines {
       val needsExtraContextDirective =
         analysis.followUp.isFollowUp ||
           analysis.ambiguity.isAmbiguous ||
-          analysis.contextReport.topicSwitched ||
           analysis.contextReport.topicRecovered ||
           analysis.feedbackOutcome.corrections.isNotEmpty() ||
           analysis.feedbackOutcome.temporaryConstraints.isNotEmpty() ||

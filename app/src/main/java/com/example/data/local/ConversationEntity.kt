@@ -15,4 +15,5 @@ data class ConversationEntity(
   val updatedAt: Long,
   val isPinned: Boolean = false,
   val isLiked: Boolean = false,
+  val ownerUid: String = "",
 )

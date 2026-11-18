@@ -1444,6 +1444,9 @@ fun UserProfileScreen(
               val uidToDelete = preferences.userUid
               val tokenToDelete = preferences.authIdToken
               onClearAllMyChats()
+              com.example.data.repository.ChatHistoryRepository
+                .getInstance()
+                .clearConversationsForUser(uidToDelete)
               FirebaseRestAuthClient.deleteUserAccountFromCloud(
                 uid = uidToDelete,
                 idToken = tokenToDelete,

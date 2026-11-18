@@ -1,9 +1,13 @@
 package com.example.ui.screens.auth
 
+import android.accounts.AccountManager
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.Intent
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
@@ -133,6 +137,7 @@ fun AuthScreen(
   onBackOrSkip: () -> Unit = {},
 ) {
   val glass = AppThemeTokens.glass
+  val context = LocalContext.current
   val focusManager = LocalFocusManager.current
   val scope = rememberCoroutineScope()
   val preferences by preferencesRepository.preferencesFlow.collectAsState()
@@ -231,6 +236,7 @@ fun AuthScreen(
             preferencesRepository.signInUser(
               uid = pendingVerificationUid,
               idToken = verifiedResult.refreshedIdToken,
+              refreshToken = verifiedResult.refreshToken,
               name = pendingVerificationName,
               email = pendingVerificationEmail,
               roleBadge = defaultRoleBadge,
@@ -376,6 +382,7 @@ fun AuthScreen(
             preferencesRepository.signInUser(
               uid = session.uid,
               idToken = session.idToken,
+              refreshToken = session.refreshToken,
               name = session.displayName,
               email = session.email,
               roleBadge = session.roleBadge,
@@ -444,6 +451,7 @@ fun AuthScreen(
           preferencesRepository.signInUser(
             uid = session.uid,
             idToken = session.idToken,
+            refreshToken = session.refreshToken,
             name = session.displayName,
             email = session.email,
             roleBadge = session.roleBadge,
@@ -457,6 +465,63 @@ fun AuthScreen(
           errorMessage = throwable.message ?: "Google Sign-In failed."
         }
     }
+  }
+
+  val googleAccountChooserLauncher =
+    rememberLauncherForActivityResult(
+      contract = ActivityResultContracts.StartActivityForResult()
+    ) { activityResult ->
+      if (activityResult.resultCode == Activity.RESULT_OK) {
+        val chosenEmail =
+          activityResult.data?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME)?.trim().orEmpty()
+        if (chosenEmail.isNotBlank()) {
+          val rememberedName =
+            preferences.knownAccounts
+              .firstOrNull { it.email.equals(chosenEmail, ignoreCase = true) }
+              ?.displayName
+              .orEmpty()
+          executeVerifiedGoogleSignIn(
+            targetEmail = chosenEmail,
+            targetName = rememberedName,
+          )
+        } else {
+          showGoogleAccountDialog = true
+        }
+      }
+    }
+
+  fun launchNativeGoogleChooserOrFallback() {
+    val hasGoogleAuthenticator =
+      try {
+        AccountManager.get(context).authenticatorTypes.any { it.type == "com.google" }
+      } catch (_: Exception) {
+        false
+      }
+    if (hasGoogleAuthenticator) {
+      val chooserIntent =
+        AccountManager.newChooseAccountIntent(
+          null,
+          null,
+          arrayOf("com.google"),
+          null,
+          null,
+          null,
+          null,
+        )
+      val canLaunchSystemPicker =
+        try {
+          chooserIntent.resolveActivity(context.packageManager) != null
+        } catch (_: Exception) {
+          false
+        }
+      if (canLaunchSystemPicker) {
+        try {
+          googleAccountChooserLauncher.launch(chooserIntent)
+          return
+        } catch (_: Exception) {}
+      }
+    }
+    showGoogleAccountDialog = true
   }
 
   fun triggerGoogleSignInOrChooser() {
@@ -475,7 +540,7 @@ fun AuthScreen(
         .takeIf { it.isNotBlank() && !it.equals("Guest User", ignoreCase = true) }
         ?: fullName.trim()
     googleDialogError = null
-    showGoogleAccountDialog = true
+    launchNativeGoogleChooserOrFallback()
   }
 
   AmbientGlassBackground {
@@ -736,24 +801,49 @@ fun AuthScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(AppSpacing.md),
               ) {
-                Box(
-                  modifier =
-                    Modifier.size(56.dp)
-                      .clip(CircleShape)
-                      .background(glass.accentCyan.copy(alpha = 0.14f))
-                      .border(
-                        width = AppBorder.focused,
-                        color = glass.accentCyan,
-                        shape = CircleShape,
-                      ),
-                  contentAlignment = Alignment.Center,
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                  Icon(
-                    imageVector = Icons.Outlined.MarkEmailRead,
-                    contentDescription = null,
-                    tint = glass.accentCyan,
-                    modifier = Modifier.size(28.dp),
-                  )
+                  Box(
+                    modifier =
+                      Modifier.size(44.dp)
+                        .clip(CircleShape)
+                        .background(
+                          Brush.radialGradient(
+                            colors = listOf(Color(0xFF0F1E3E), Color(0xFF080E20))
+                          )
+                        )
+                        .border(
+                          width = 1.5.dp,
+                          brush =
+                            Brush.linearGradient(
+                              colors = listOf(glass.accentCyan, ElectricBlue, RoyalViolet)
+                            ),
+                          shape = CircleShape,
+                        ),
+                    contentAlignment = Alignment.Center,
+                  ) {
+                    Image(
+                      painter = painterResource(id = R.drawable.ic_launcher_foreground),
+                      contentDescription = "Astryn AI Logo",
+                      modifier = Modifier.size(38.dp),
+                    )
+                  }
+                  Column(horizontalAlignment = Alignment.Start) {
+                    Text(
+                      text = "Astryn AI",
+                      style = MaterialTheme.typography.titleMedium,
+                      fontWeight = FontWeight.Bold,
+                      color = glass.textPrimary,
+                    )
+                    Text(
+                      text = "Official Account Verification",
+                      style = MaterialTheme.typography.labelSmall,
+                      color = glass.accentCyan,
+                      fontWeight = FontWeight.SemiBold,
+                    )
+                  }
                 }
 
                 Row(
@@ -787,7 +877,7 @@ fun AuthScreen(
 
                 Text(
                   text =
-                    "We sent a verification link to your email. Please open your Inbox (or Spam folder), click the verification link, and then tap Verify below.",
+                    "Astryn AI sent a verification link to your inbox (${FirebaseRestAuthClient.AUTH_DOMAIN}). Open your Email App (Inbox or Spam), tap the link for Astryn AI, and then tap Verify below.",
                   style = MaterialTheme.typography.bodySmall,
                   color = glass.textSecondary,
                   textAlign = TextAlign.Center,
@@ -860,6 +950,7 @@ fun AuthScreen(
                                 preferencesRepository.signInUser(
                                   uid = pendingVerificationUid,
                                   idToken = check.refreshedIdToken,
+                                  refreshToken = check.refreshToken,
                                   name = pendingVerificationName,
                                   email = pendingVerificationEmail,
                                   roleBadge = defaultRoleBadge,
@@ -1010,6 +1101,50 @@ fun AuthScreen(
                       color = glass.textSecondary,
                     )
                   }
+                }
+
+                Row(
+                  modifier =
+                    Modifier.fillMaxWidth()
+                      .heightIn(min = 44.dp)
+                      .clip(RoundedCornerShape(12.dp))
+                      .background(glass.surfaceStandard)
+                      .border(
+                        width = AppBorder.hairline,
+                        color = glass.accentCyan.copy(alpha = 0.45f),
+                        shape = RoundedCornerShape(12.dp),
+                      )
+                      .clickable {
+                        try {
+                          val emailIntent =
+                            Intent(Intent.ACTION_MAIN).apply {
+                              addCategory(Intent.CATEGORY_APP_EMAIL)
+                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                          context.startActivity(emailIntent)
+                        } catch (_: Exception) {
+                          successBannerMessage =
+                            "Please open your Gmail or Mail app to tap the Astryn AI link."
+                        }
+                      }
+                      .padding(horizontal = 12.dp, vertical = 10.dp)
+                      .testTag("auth_open_email_app_button"),
+                  horizontalArrangement = Arrangement.Center,
+                  verticalAlignment = Alignment.CenterVertically,
+                ) {
+                  Icon(
+                    imageVector = Icons.Outlined.MarkEmailRead,
+                    contentDescription = null,
+                    tint = glass.accentCyan,
+                    modifier = Modifier.size(16.dp),
+                  )
+                  Spacer(modifier = Modifier.width(6.dp))
+                  Text(
+                    text = "Open Email App",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = glass.accentCyan,
+                  )
                 }
               }
             }
@@ -1552,24 +1687,31 @@ fun AuthScreen(
   // =========================================================================
   if (showGoogleAccountDialog) {
     val quickAccounts =
-      remember(preferences.userEmail, preferences.userName) {
+      remember(preferences.knownAccounts, preferences.userEmail, preferences.userName) {
         buildList {
+          val seen = HashSet<String>()
+          for (acct in preferences.knownAccounts) {
+            val clean = acct.email.trim().lowercase()
+            if (clean.isNotBlank() && seen.add(clean)) {
+              add(
+                clean to
+                  acct.displayName.ifBlank {
+                    UserPreferencesRepository.deriveCleanNameFromEmail(clean)
+                  }
+              )
+            }
+          }
+          val activeClean = preferences.userEmail.trim().lowercase()
           if (
-            preferences.userEmail.isNotBlank() &&
-              EmailSecurityValidator.validateEmail(preferences.userEmail).isValidRealEmail
+            activeClean.isNotBlank() &&
+              EmailSecurityValidator.validateEmail(activeClean).isValidRealEmail &&
+              seen.add(activeClean)
           ) {
             add(
-              preferences.userEmail to
+              activeClean to
                 preferences.userName.ifBlank {
-                  preferences.userEmail.substringBefore("@").replaceFirstChar { it.uppercase() }
+                  UserPreferencesRepository.deriveCleanNameFromEmail(activeClean)
                 }
-            )
-          }
-          val primaryGoogleEmail = "am7620711@gmail.com"
-          if (none { it.first.equals(primaryGoogleEmail, ignoreCase = true) }) {
-            add(
-              primaryGoogleEmail to
-                UserPreferencesRepository.deriveCleanNameFromEmail(primaryGoogleEmail)
             )
           }
         }
@@ -1595,9 +1737,17 @@ fun AuthScreen(
       },
       text = {
         Column(
-          modifier = Modifier.fillMaxWidth().testTag("auth_google_account_dialog"),
+          modifier =
+            Modifier.fillMaxWidth()
+              .verticalScroll(rememberScrollState())
+              .testTag("auth_google_account_dialog"),
           verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+          Text(
+            text = "Choose a Google account or sign in with another Gmail address:",
+            style = MaterialTheme.typography.bodySmall,
+            color = glass.textSecondary,
+          )
           quickAccounts.forEachIndexed { idx, (acctEmail, acctName) ->
             Row(
               modifier =

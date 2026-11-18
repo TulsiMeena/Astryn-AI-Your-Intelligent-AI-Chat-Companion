@@ -282,4 +282,76 @@ class ZoyaLiveVoiceTest {
     assertFalse(reply2.contains("Arey yaar, main toh bilkul mast hoon"))
     assertTrue(reply2.contains("Aoede") && reply2.contains("Dual-Engine"))
   }
+
+  @Test
+  fun setupFrameDefaultsAndAudioStreamEndFrame_enableNativeAudioTranscriptionAndTurnFlush() {
+    assertEquals(
+      "models/gemini-2.5-flash-native-audio-preview-12-2025",
+      GeminiLiveVoiceSession.DEFAULT_LIVE_MODEL,
+    )
+    assertEquals(
+      "models/gemini-2.5-flash-native-audio-preview-12-2025",
+      GeminiLiveVoiceSession.SUPPORTED_LIVE_MODELS.first(),
+    )
+
+    val defaultSetupJson =
+      GeminiLiveVoiceSession.buildSetupFrameJson(mood = LiveGirlfriendMood.NATKHAT)
+    val setupObj = JSONObject(defaultSetupJson).getJSONObject("setup")
+    assertEquals(
+      "models/gemini-2.5-flash-native-audio-preview-12-2025",
+      setupObj.getString("model"),
+    )
+    assertTrue(setupObj.has("inputAudioTranscription"))
+    assertTrue(setupObj.has("outputAudioTranscription"))
+
+    val streamEndObj = JSONObject(GeminiLiveVoiceSession.buildRealtimeAudioStreamEndFrameJson())
+    assertTrue(streamEndObj.getJSONObject("realtimeInput").getBoolean("audioStreamEnd"))
+  }
+
+  @Test
+  fun missingApiKey_switchesCleanlyToFallbackModeWithoutFakeReadyState() {
+    val session = GeminiLiveVoiceSession(apiKeyProvider = { "" })
+    session.connectIfPossible(LiveGirlfriendMood.NATKHAT)
+
+    val snap = session.stateFlow.value
+    assertFalse(session.isLiveWebSocketReady())
+    assertFalse(snap.isSetupComplete)
+    assertEquals(LiveConnectionState.DISCONNECTED, snap.connectionState)
+    assertTrue(snap.isUsingFallbackVoiceEngine)
+    session.shutdown()
+  }
+
+  @Test
+  fun outputTranscriptionWithoutModelText_stillDeliversCompletedTurnTranscript() {
+    var completedTranscript = ""
+    var playedNativeAudio = true
+    var latestUserDelta = ""
+    val session =
+      GeminiLiveVoiceSession(
+        apiKeyProvider = { "AIzaSyTestDummyKeyForUnitTesting123456" },
+        onUserTranscriptDelta = { latestUserDelta = it },
+        onLiveTurnCompleteWithAudioFlag = { transcript, audioFlag ->
+          completedTranscript = transcript
+          playedNativeAudio = audioFlag
+        },
+      )
+
+    session.handleIncomingLiveJson("""{"setupComplete": {}}""")
+    session.handleIncomingLiveJson(
+      """
+      {
+        "serverContent": {
+          "inputTranscription": { "text": "Hello Jarvis" },
+          "outputTranscription": { "text": "Namaste boss, bataiye kya help karun?" },
+          "turnComplete": true
+        }
+      }
+      """.trimIndent()
+    )
+
+    assertEquals("Hello Jarvis", latestUserDelta)
+    assertEquals("Namaste boss, bataiye kya help karun?", completedTranscript)
+    assertFalse(playedNativeAudio)
+    session.shutdown()
+  }
 }
