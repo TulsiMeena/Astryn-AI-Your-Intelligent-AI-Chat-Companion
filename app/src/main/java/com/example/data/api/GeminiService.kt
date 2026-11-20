@@ -53,7 +53,7 @@ sealed class GeminiException(message: String, cause: Throwable? = null) : Except
           )
         400 ->
           append(
-            "The configured Gemini API key was rejected as invalid (HTTP 400). Please check that you pasted a valid AIza... key."
+            "The configured Gemini API key was rejected as invalid (HTTP 400). Please check that you pasted a valid AIza... or AQ.... key."
           )
         else ->
           append(
@@ -149,11 +149,12 @@ data class ContextWindowResult(
 class GeminiService(
   private val defaultModel: String = DEFAULT_MODEL,
   private val okHttpClient: OkHttpClient = defaultClient,
-  private val apiKeyProvider: () -> String = { requireApiKey() },
+  private val apiKeyProvider: () -> String = DEFAULT_API_KEY_PROVIDER,
   private val retryPolicy: RetryPolicyConfig = RetryPolicyConfig(),
   private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
   companion object {
+    private val DEFAULT_API_KEY_PROVIDER: () -> String = { requireApiKey() }
     /**
      * Default officially supported Gemini model for chat, multimodal vision/PDF, & grounding
      * on `https://generativelanguage.googleapis.com/v1beta`.
@@ -1075,7 +1076,11 @@ class GeminiService(
               markBuiltInPlatformKeyRejectedIfMatches(activeApiKey)
             }
 
-            if ((code == 400 || code == 401 || code == 403 || code == 404 || code == 429) && !triedFallbackKey) {
+            if (
+              apiKeyProvider === DEFAULT_API_KEY_PROVIDER &&
+                (code == 400 || code == 401 || code == 403 || code == 404 || code == 429) &&
+                !triedFallbackKey
+            ) {
               val fallbackKey = resolveFallbackApiKey(activeApiKey)
               if (!fallbackKey.isNullOrBlank()) {
                 activeApiKey = fallbackKey

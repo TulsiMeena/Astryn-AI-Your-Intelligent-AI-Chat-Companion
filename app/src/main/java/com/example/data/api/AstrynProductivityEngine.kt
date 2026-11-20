@@ -18,9 +18,8 @@ import java.math.BigDecimal
 import java.math.MathContext
 import java.math.RoundingMode
 import java.nio.charset.StandardCharsets
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -4780,8 +4779,6 @@ fun verifyFixedBehaviorHandlesEdgeCasesSafely() {
   }
 
   private fun LocalDateStamp(): String {
-    return DateTimeFormatter.ISO_LOCAL_DATE
-      .withZone(ZoneId.systemDefault())
-      .format(Instant.now())
+    return SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
   }
 }

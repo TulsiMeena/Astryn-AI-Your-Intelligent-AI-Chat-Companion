@@ -619,4 +619,32 @@ class AstrynPhase18GeminiQualityBenchmarkTest {
     assertFalse(JSONObject(payloads[1]).getJSONObject("generationConfig").has("thinkingConfig"))
     assertFalse(SafeDiagnosticLogger.redactSecrets("key=$keyUserA").contains(keyUserA))
   }
+
+  @Test
+  fun categoryP_modernAqGeminiApiKeyValidationEncryptionAndRedaction() {
+    val modernAqKey = "AQ.Ab8RN6Test_iqr_jLo_f53OOBS3feXdkgo5Jw"
+    val validation = UserApiKeyManager.validateKeyFormat(modernAqKey)
+    assertTrue("Modern AQ. Gemini API keys must pass validation", validation.isValidFormat)
+    assertEquals(modernAqKey, validation.cleanedKey)
+
+    val keyManager = UserApiKeyManager()
+    keyManager.bindToUser("uid_modern_aq")
+    val saveRes = keyManager.saveApiKey(modernAqKey)
+    assertTrue(saveRes.isSuccess)
+    assertEquals("AQ.A••••••••o5Jw", saveRes.getOrNull()?.maskedKeyPreview)
+    assertEquals(modernAqKey, keyManager.getDecryptedApiKey())
+    assertTrue(keyManager.getEncryptedPayloadMetadataForAudit(modernAqKey).isPlaintextAbsentFromStorage)
+
+    assertTrue(SafeDiagnosticLogger.containsSecretCredential("Error with key $modernAqKey"))
+    val redacted = SafeDiagnosticLogger.redactSecrets("x-goog-api-key: $modernAqKey failed")
+    assertFalse(redacted.contains(modernAqKey))
+    assertFalse(SafeDiagnosticLogger.containsSecretCredential(redacted))
+
+    val liveSanitized =
+      com.example.data.api.GeminiLiveVoiceSession.sanitizeDiagnosticMessage(
+        "WebSocket error for $modernAqKey",
+        modernAqKey,
+      )
+    assertFalse(liveSanitized.contains(modernAqKey))
+  }
 }

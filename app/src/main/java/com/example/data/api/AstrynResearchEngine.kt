@@ -1190,6 +1190,7 @@ object AstrynResearchEngine {
     private val secretLeakPatterns =
       listOf(
         Regex("AIza[0-9A-Za-z_\\-]{20,}"),
+        Regex("AQ\\.[0-9A-Za-z_\\-.]{15,}"),
         Regex("Bearer\\s+[0-9A-Za-z._\\-]{20,}", RegexOption.IGNORE_CASE),
       )
 

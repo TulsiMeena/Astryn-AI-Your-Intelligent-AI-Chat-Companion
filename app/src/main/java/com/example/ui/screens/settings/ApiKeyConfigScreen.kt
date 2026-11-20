@@ -555,9 +555,9 @@ fun AiProviderApiKeyPanel(
           },
           placeholder =
             if (configState.hasSavedKey) {
-              "Paste a new Gemini API key (AIza…) to replace saved key"
+              "Paste a new Gemini API key (AIza… or AQ.…) to replace saved key"
             } else {
-              "Paste your Gemini API key (AIza…)"
+              "Paste your Gemini API key (AIza… or AQ.…)"
             },
           singleLine = true,
           maxLines = 1,
@@ -883,7 +883,7 @@ fun AiProviderApiKeyPanel(
           color = glass.textSecondary,
         )
         Text(
-          text = "2. Tap 'Create API key', copy your key (starts with AIza…), and paste it into the field above.",
+          text = "2. Tap 'Create API key', copy your key (starts with AIza… or AQ.…), and paste it into the field above.",
           style = MaterialTheme.typography.bodySmall,
           color = glass.textSecondary,
         )

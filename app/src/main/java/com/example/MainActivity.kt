@@ -170,7 +170,9 @@ class MainActivity : ComponentActivity() {
           currentScreen = AppScreen.Auth(initialIsSignUp = false)
         } else if (lastAuthenticatedUid != effectiveUid) {
           lastAuthenticatedUid = effectiveUid
-          currentScreen = AppScreen.Home
+          if (pendingWidgetAction == null) {
+            currentScreen = AppScreen.Home
+          }
         }
       }
 

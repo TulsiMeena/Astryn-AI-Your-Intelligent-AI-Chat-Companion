@@ -35,9 +35,6 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
-import java.time.Clock
-import java.time.Instant
-import java.time.ZoneId
 
 /**
  * ASTRYN AI — PHASE 6 VERIFICATION SUITE (30 SCENARIOS)
@@ -49,8 +46,8 @@ import java.time.ZoneId
  */
 class AstrynPhase6PersonalIntelligenceTest {
 
-    private val fixedInstant = Instant.parse("2026-05-12T13:00:00Z") // 18:30 IST (06:30 PM Evening in Asia/Kolkata, Tuesday)
-    private val istZone = ZoneId.of("Asia/Kolkata")
+    private val fixedInstantMillis = 1778590800_000L // 2026-05-12T13:00:00Z -> 18:30 IST (06:30 PM Evening in Asia/Kolkata, Tuesday)
+    private val istZoneId = "Asia/Kolkata"
 
     private val deterministicWeatherGateway = object : WeatherDataGateway {
         override fun fetchLiveWeather(
@@ -115,7 +112,7 @@ class AstrynPhase6PersonalIntelligenceTest {
     @Before
     fun setUp() {
         AstrynPersonalIntelligenceEngine.clearAllPersonalIntelligenceStateForTesting()
-        AstrynTimeIntelligence.clockProvider = Clock.fixed(fixedInstant, istZone)
+        AstrynTimeIntelligence.setFixedClockForTesting(fixedInstantMillis, istZoneId)
         AstrynWeatherIntelligence.weatherGateway = deterministicWeatherGateway
     }
 
@@ -459,7 +456,7 @@ class AstrynPhase6PersonalIntelligenceTest {
     @Test
     fun test20_offlineCachedWeatherClearlyLabeledWithTimestamp() {
         AstrynLocationManager.setPreferredWeatherCity("user_alpha", "Kolkata")
-        val initialFetchMs = fixedInstant.minusSeconds(3600).toEpochMilli() // 1 hour ago (stale > 15 min)
+        val initialFetchMs = fixedInstantMillis - 3_600_000L // 1 hour ago (stale > 15 min)
 
         // First fetch online to populate cache
         AstrynWeatherIntelligence.forceOfflineMode = false

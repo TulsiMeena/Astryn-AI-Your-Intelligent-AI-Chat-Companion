@@ -76,14 +76,14 @@ class ChatHistoryRepository(
     if (entityOwner.isNotBlank()) {
       conversationOwners[conversationId] = entityOwner
       try {
-        ownerPrefs?.edit()?.putString("owner_$conversationId", entityOwner)?.commit()
+        ownerPrefs?.edit()?.putString("owner_$conversationId", entityOwner)?.apply()
       } catch (_: Exception) {}
       return entityOwner == uid
     }
     if (conversationId.startsWith("${uid}_")) {
       conversationOwners[conversationId] = uid
       try {
-        ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.commit()
+        ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.apply()
       } catch (_: Exception) {}
       return true
     }
@@ -97,7 +97,7 @@ class ChatHistoryRepository(
       if (existingOwner == null || existingOwner == uid) {
         conversationOwners[conversationId] = uid
         try {
-          ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.commit()
+          ownerPrefs?.edit()?.putString("owner_$conversationId", uid)?.apply()
         } catch (_: Exception) {}
       }
     }
@@ -168,7 +168,7 @@ class ChatHistoryRepository(
           for (convId in aliasConvIds) {
             conversationOwners[convId] = currentUid
             try {
-              ownerPrefs?.edit()?.putString("owner_$convId", currentUid)?.commit()
+              ownerPrefs?.edit()?.putString("owner_$convId", currentUid)?.apply()
             } catch (_: Exception) {}
             conversationsMap[convId]?.let { existing ->
               conversationsMap[convId] = existing.copy(ownerUid = currentUid)
@@ -199,7 +199,7 @@ class ChatHistoryRepository(
 
             conversationOwners[convId] = currentUid
             try {
-              ownerPrefs?.edit()?.putString("owner_$convId", currentUid)?.commit()
+              ownerPrefs?.edit()?.putString("owner_$convId", currentUid)?.apply()
             } catch (_: Exception) {}
 
             val normalizedCloudConv = cloudConv.conversation.copy(ownerUid = currentUid)
@@ -790,7 +790,7 @@ class ChatHistoryRepository(
         searchableContentByConversation.remove(conversationId)
         conversationOwners.remove(conversationId)
         try {
-          ownerPrefs?.edit()?.remove("owner_$conversationId")?.commit()
+          ownerPrefs?.edit()?.remove("owner_$conversationId")?.apply()
         } catch (_: Exception) {}
         com.example.ui.components.SafeMarkdownParser.clearCaches()
         emitSortedConversations()
@@ -830,7 +830,7 @@ class ChatHistoryRepository(
             searchableContentByConversation.remove(convId)
             conversationOwners.remove(convId)
             try {
-              ownerPrefs?.edit()?.remove("owner_$convId")?.commit()
+              ownerPrefs?.edit()?.remove("owner_$convId")?.apply()
             } catch (_: Exception) {}
             chatDao?.deleteAllMessagesForConversation(convId)
             chatDao?.deleteConversationById(convId)
@@ -883,7 +883,7 @@ class ChatHistoryRepository(
           searchableContentByConversation.remove(convId)
           conversationOwners.remove(convId)
           try {
-            ownerPrefs?.edit()?.remove("owner_$convId")?.commit()
+            ownerPrefs?.edit()?.remove("owner_$convId")?.apply()
           } catch (_: Exception) {}
           chatDao?.deleteAllMessagesForConversation(convId)
           chatDao?.deleteConversationById(convId)
@@ -1245,8 +1245,13 @@ class ChatHistoryRepository(
     }
 
   private fun generatePdfBytesForMessage(dateStr: String, bodyText: String): ByteArray {
+    val pdfDocument =
+      try {
+        PdfDocument()
+      } catch (_: Exception) {
+        return "%PDF-1.4\n% Astryn AI Response ($dateStr)\n${bodyText}\n%%EOF".toByteArray(Charsets.UTF_8)
+      }
     return try {
-      val pdfDocument = PdfDocument()
       val pageWidth = 595
       val pageHeight = 842
       val margin = 44f
@@ -1316,7 +1321,6 @@ class ChatHistoryRepository(
 
       val out = ByteArrayOutputStream()
       pdfDocument.writeTo(out)
-      pdfDocument.close()
       val raw = out.toByteArray()
       if (raw.isNotEmpty()) {
         raw
@@ -1325,6 +1329,10 @@ class ChatHistoryRepository(
       }
     } catch (_: Exception) {
       "%PDF-1.4\n% Astryn AI Response ($dateStr)\n${bodyText}\n%%EOF".toByteArray(Charsets.UTF_8)
+    } finally {
+      try {
+        pdfDocument.close()
+      } catch (_: Exception) {}
     }
   }
 

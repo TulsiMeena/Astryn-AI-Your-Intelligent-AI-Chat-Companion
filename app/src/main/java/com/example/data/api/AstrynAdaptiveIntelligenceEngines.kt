@@ -767,6 +767,7 @@ object AstrynAdaptiveIntelligenceEngines {
 
     private val EXTRA_SECRET_PATTERNS = listOf(
       Regex("""AIza[0-9A-Za-z\-_]{25,}"""),
+      Regex("""AQ\.[0-9A-Za-z\-_.]{15,}"""),
       Regex("""sk-[0-9A-Za-z\-_]{16,}"""),
       Regex("""(?i)\b(aadhaar|pan\s*card|bank\s*account|ifsc|routing\s*number|atm\s*pin)\b\s*[:=]?\s*\S+"""),
     )

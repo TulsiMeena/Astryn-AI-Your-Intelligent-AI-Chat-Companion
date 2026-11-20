@@ -4,7 +4,6 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import android.util.Base64
 import androidx.compose.runtime.Immutable
 import com.example.data.api.GeminiException
 import com.example.data.api.SafeDiagnosticLogger
@@ -163,7 +162,7 @@ class UserApiKeyManager(
     private const val KEY_LAST_TESTED_MODEL = "enc_api_key_last_model"
     private const val KEY_FALLBACK_AES_SECRET_B64 = "enc_fallback_aes_secret_b64"
 
-    private val VALID_KEY_CHARS_REGEX = Regex("""^[A-Za-z0-9\-_]{20,100}$""")
+    private val VALID_KEY_CHARS_REGEX = Regex("""^[A-Za-z0-9\-_.]{20,160}$""")
 
     @Volatile private var defaultInstance: UserApiKeyManager? = null
 
@@ -207,6 +206,71 @@ class UserApiKeyManager(
       return "${prefix}••••••••${suffix}"
     }
 
+    private val BASE64_ALPHABET =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".toCharArray()
+    private val BASE64_DECODE_TABLE =
+      IntArray(256) { -1 }.apply {
+        for (i in BASE64_ALPHABET.indices) {
+          this[BASE64_ALPHABET[i].code] = i
+        }
+      }
+
+    internal fun encodeBase64(bytes: ByteArray): String {
+      if (bytes.isEmpty()) return ""
+      val out = StringBuilder(((bytes.size + 2) / 3) * 4)
+      var i = 0
+      while (i < bytes.size) {
+        val b0 = bytes[i].toInt() and 0xFF
+        val hasB1 = i + 1 < bytes.size
+        val hasB2 = i + 2 < bytes.size
+        val b1 = if (hasB1) bytes[i + 1].toInt() and 0xFF else 0
+        val b2 = if (hasB2) bytes[i + 2].toInt() and 0xFF else 0
+        val triple = (b0 shl 16) or (b1 shl 8) or b2
+
+        out.append(BASE64_ALPHABET[(triple ushr 18) and 0x3F])
+        out.append(BASE64_ALPHABET[(triple ushr 12) and 0x3F])
+        out.append(if (hasB1) BASE64_ALPHABET[(triple ushr 6) and 0x3F] else '=')
+        out.append(if (hasB2) BASE64_ALPHABET[triple and 0x3F] else '=')
+        i += 3
+      }
+      return out.toString()
+    }
+
+    internal fun decodeBase64(base64: String): ByteArray {
+      val clean = base64.filterNot { it.isWhitespace() }
+      if (clean.isEmpty()) return ByteArray(0)
+      require(clean.length % 4 == 0) { "Invalid Base64 length" }
+      val padding =
+        when {
+          clean.endsWith("==") -> 2
+          clean.endsWith("=") -> 1
+          else -> 0
+        }
+      val outLen = (clean.length / 4) * 3 - padding
+      val out = ByteArray(outLen)
+      var outIdx = 0
+      var i = 0
+      while (i < clean.length) {
+        val c0 = BASE64_DECODE_TABLE.getOrElse(clean[i].code) { -1 }
+        val c1 = BASE64_DECODE_TABLE.getOrElse(clean[i + 1].code) { -1 }
+        val ch2 = clean[i + 2]
+        val ch3 = clean[i + 3]
+        val c2 = if (ch2 == '=') 0 else BASE64_DECODE_TABLE.getOrElse(ch2.code) { -1 }
+        val c3 = if (ch3 == '=') 0 else BASE64_DECODE_TABLE.getOrElse(ch3.code) { -1 }
+        require(c0 >= 0 && c1 >= 0 && c2 >= 0 && c3 >= 0) { "Invalid Base64 character" }
+        val triple = (c0 shl 18) or (c1 shl 12) or (c2 shl 6) or c3
+        out[outIdx++] = ((triple ushr 16) and 0xFF).toByte()
+        if (ch2 != '=' && outIdx < outLen) {
+          out[outIdx++] = ((triple ushr 8) and 0xFF).toByte()
+        }
+        if (ch3 != '=' && outIdx < outLen) {
+          out[outIdx++] = (triple and 0xFF).toByte()
+        }
+        i += 4
+      }
+      return out
+    }
+
     /**
      * Validates the user-entered Gemini API key format prior to saving.
      * Explicitly notes that format validation checks structure only and does not prove live validity.
@@ -239,20 +303,20 @@ class UserApiKeyManager(
           feedbackMessage = "API key must not contain spaces, tabs, or line breaks.",
         )
       }
-      if (!trimmed.startsWith("AIza")) {
+      if (!trimmed.startsWith("AIza") && !trimmed.startsWith("AQ.")) {
         return ApiKeyFormatValidation(
           isValidFormat = false,
           cleanedKey = "",
           feedbackMessage =
-            "Invalid format: Google AI Studio Gemini API keys begin with 'AIza' (for example, AIzaSy...).",
+            "Invalid format: Google AI Studio Gemini API keys begin with 'AIza' or 'AQ.' (for example, AIzaSy... or AQ.Ab8...).",
         )
       }
-      if (trimmed.length < 24 || trimmed.length > 80 || !VALID_KEY_CHARS_REGEX.matches(trimmed)) {
+      if (trimmed.length < 24 || trimmed.length > 160 || !VALID_KEY_CHARS_REGEX.matches(trimmed)) {
         return ApiKeyFormatValidation(
           isValidFormat = false,
           cleanedKey = "",
           feedbackMessage =
-            "Invalid length or characters: Gemini API keys are typically 39 alphanumeric characters (AIza...).",
+            "Invalid length or characters: Gemini API keys use letters, digits, '-', '_', or '.' (24–160 chars, starting with AIza or AQ.).",
         )
       }
       return ApiKeyFormatValidation(
@@ -303,7 +367,7 @@ class UserApiKeyManager(
     val ivBytesLen =
       if (!ivB64.isNullOrBlank()) {
         try {
-          java.util.Base64.getDecoder().decode(ivB64).size
+          decodeBase64(ivB64).size
         } catch (_: Exception) {
           0
         }
@@ -501,7 +565,7 @@ class UserApiKeyManager(
               "HTTP 403 Permission Denied: Your key is restricted or the Generative Language API is disabled for its project.$detailSuffix Check key restrictions in Google AI Studio or replace the key."
           400 ->
             ApiConnectionStatus.AUTH_ERROR to
-              "HTTP 400 Invalid API Key: Google Gemini rejected this key as invalid.$detailSuffix Verify that you copied the full AIza... key from Google AI Studio."
+              "HTTP 400 Invalid API Key: Google Gemini rejected this key as invalid.$detailSuffix Verify that you copied the full AIza... or AQ.... key from Google AI Studio."
           else ->
             ApiConnectionStatus.AUTH_ERROR to
               "HTTP 401 Authentication Failed: The API key was rejected as unauthorized or revoked.$detailSuffix Please replace your key with an active key from Google AI Studio."
@@ -601,15 +665,15 @@ class UserApiKeyManager(
     }
     val ivBytes = cipher.iv
     val ciphertextBytes = cipher.doFinal(plaintext.toByteArray(StandardCharsets.UTF_8))
-    val cipherB64 = java.util.Base64.getEncoder().encodeToString(ciphertextBytes)
-    val ivB64 = java.util.Base64.getEncoder().encodeToString(ivBytes)
+    val cipherB64 = encodeBase64(ciphertextBytes)
+    val ivB64 = encodeBase64(ivBytes)
     return cipherB64 to ivB64
   }
 
   private fun decryptCiphertext(ciphertextB64: String, ivB64: String): String {
     val secretKey = getOrCreateAesSecretKey()
-    val cipherBytes = java.util.Base64.getDecoder().decode(ciphertextB64)
-    val ivBytes = java.util.Base64.getDecoder().decode(ivB64)
+    val cipherBytes = decodeBase64(ciphertextB64)
+    val ivBytes = decodeBase64(ivB64)
     val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
     val spec = GCMParameterSpec(GCM_TAG_BITS, ivBytes)
     cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)
@@ -646,14 +710,14 @@ class UserApiKeyManager(
       isHardwareKeystoreActive = false
       val existingSecretB64 = readString(KEY_FALLBACK_AES_SECRET_B64)
       if (!existingSecretB64.isNullOrBlank()) {
-        val decoded = java.util.Base64.getDecoder().decode(existingSecretB64)
+        val decoded = decodeBase64(existingSecretB64)
         if (decoded.size == 32) {
           return SecretKeySpec(decoded, "AES")
         }
       }
       val randomBytes = ByteArray(32)
       SecureRandom().nextBytes(randomBytes)
-      val encoded = java.util.Base64.getEncoder().encodeToString(randomBytes)
+      val encoded = encodeBase64(randomBytes)
       writeString(KEY_FALLBACK_AES_SECRET_B64, encoded)
       return SecretKeySpec(randomBytes, "AES")
     }

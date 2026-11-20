@@ -16,16 +16,11 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
-import java.time.Clock
-import java.time.Duration
-import java.time.Instant
-import java.time.LocalDate
-import java.time.LocalTime
-import java.time.ZoneId
-import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
-import java.time.format.TextStyle
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -111,6 +106,7 @@ object AstrynPersonalIntelligenceEngine {
 
     private val SENSITIVE_DATA_PATTERNS = listOf(
         Regex("""AIza[0-9A-Za-z\-_]{20,}"""),
+        Regex("""AQ\.[0-9A-Za-z\-_.]{15,}"""),
         Regex("""sk-[0-9A-Za-z]{20,}"""),
         Regex("""(?i)\b(password|passwd|passcode|pin|cvv|otp|secret\s*key|private\s*key|bearer\s+[a-z0-9\-_\.]+|credit\s*card)\b\s*[:=]?\s*\S+"""),
         Regex("""\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b"""),
@@ -846,7 +842,7 @@ object AstrynPersonalIntelligenceEngine {
     }
 
     data class LiveTimeSnapshot(
-        val zonedDateTime: ZonedDateTime,
+        val epochMillis: Long,
         val formattedTime12h: String,
         val formattedTime24h: String,
         val formattedDate: String,
@@ -877,11 +873,26 @@ object AstrynPersonalIntelligenceEngine {
 
     object AstrynTimeIntelligence {
         @Volatile
-        var clockProvider: Clock = Clock.systemDefaultZone()
+        var timeProviderMillis: () -> Long = { System.currentTimeMillis() }
 
-        private val TIME_12H_FMT = DateTimeFormatter.ofPattern("hh:mm a", Locale.US)
-        private val TIME_24H_FMT = DateTimeFormatter.ofPattern("HH:mm", Locale.US)
-        private val HUMAN_DATE_FMT = DateTimeFormatter.ofPattern("dd MMMM yyyy", Locale.US)
+        @Volatile
+        var defaultTimeZoneId: String? = null
+
+        fun currentTimeMillis(): Long = timeProviderMillis()
+
+        fun setFixedClockForTesting(epochMillis: Long, timeZoneId: String = "Asia/Kolkata") {
+            timeProviderMillis = { epochMillis }
+            defaultTimeZoneId = timeZoneId
+        }
+
+        fun resetClockToSystemDefault() {
+            timeProviderMillis = { System.currentTimeMillis() }
+            defaultTimeZoneId = null
+        }
+
+        private fun formatInZone(pattern: String, date: Date, tz: TimeZone): String {
+            return SimpleDateFormat(pattern, Locale.US).apply { timeZone = tz }.format(date)
+        }
 
         private val HINDI_DAYS = mapOf(
             "MONDAY" to "Somvaar (Monday)",
@@ -932,57 +943,84 @@ object AstrynPersonalIntelligenceEngine {
             }
         }
 
-        fun getCurrentSnapshot(zoneOverride: ZoneId? = null): LiveTimeSnapshot {
-            val baseClock = if (zoneOverride != null) clockProvider.withZone(zoneOverride) else clockProvider
-            val now = ZonedDateTime.now(baseClock)
-            val tomorrow = now.plusDays(1)
-            val yesterday = now.minusDays(1)
-            val dayKey = now.dayOfWeek.name
-            val dayEnglish = now.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.US)
-            val dayHindi = HINDI_DAYS[dayKey] ?: dayEnglish
-            val monthName = now.month.getDisplayName(TextStyle.FULL, Locale.US)
+        private fun resolveEffectiveTimeZone(zoneIdOverride: String?): TimeZone {
+            val chosen = zoneIdOverride?.trim()?.ifBlank { null } ?: defaultTimeZoneId
+            return if (chosen != null) TimeZone.getTimeZone(chosen) else TimeZone.getDefault()
+        }
+
+        fun getCurrentSnapshot(zoneOverride: String? = null): LiveTimeSnapshot {
+            val tz = resolveEffectiveTimeZone(zoneOverride)
+            val nowMillis = currentTimeMillis()
+            val nowDate = Date(nowMillis)
+            val cal = Calendar.getInstance(tz).apply { timeInMillis = nowMillis }
+
+            val tomorrowCal = (cal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, 1) }
+            val yesterdayCal = (cal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, -1) }
+
+            val dayEnglish = formatInZone("EEEE", nowDate, tz)
+            val dayHindi = HINDI_DAYS[dayEnglish.uppercase(Locale.US)] ?: dayEnglish
+            val monthName = formatInZone("MMMM", nowDate, tz)
+
+            val offsetMinutesTotal = tz.getOffset(nowMillis) / 60_000
+            val offsetSign = if (offsetMinutesTotal >= 0) "+" else "-"
+            val absOffsetMins = abs(offsetMinutesTotal)
+            val offsetStr = String.format(
+                Locale.US,
+                "UTC%s%02d:%02d",
+                offsetSign,
+                absOffsetMins / 60,
+                absOffsetMins % 60
+            )
 
             return LiveTimeSnapshot(
-                zonedDateTime = now,
-                formattedTime12h = now.format(TIME_12H_FMT),
-                formattedTime24h = now.format(TIME_24H_FMT),
-                formattedDate = now.format(HUMAN_DATE_FMT),
-                isoDate = now.toLocalDate().toString(),
+                epochMillis = nowMillis,
+                formattedTime12h = formatInZone("hh:mm a", nowDate, tz),
+                formattedTime24h = formatInZone("HH:mm", nowDate, tz),
+                formattedDate = formatInZone("dd MMMM yyyy", nowDate, tz),
+                isoDate = formatInZone("yyyy-MM-dd", nowDate, tz),
                 dayOfWeekEnglish = dayEnglish,
                 dayOfWeekHindi = dayHindi,
                 monthName = monthName,
-                year = now.year,
-                timeZoneId = now.zone.id,
-                utcOffsetString = "UTC${now.offset.id.let { if (it == "Z") "+00:00" else it }}",
-                periodOfDay = classifyPeriodOfDay(now.hour),
-                tomorrowFormattedDate = tomorrow.format(HUMAN_DATE_FMT),
-                tomorrowDayOfWeekEnglish = tomorrow.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.US),
-                yesterdayFormattedDate = yesterday.format(HUMAN_DATE_FMT)
+                year = cal.get(Calendar.YEAR),
+                timeZoneId = tz.id,
+                utcOffsetString = offsetStr,
+                periodOfDay = classifyPeriodOfDay(cal.get(Calendar.HOUR_OF_DAY)),
+                tomorrowFormattedDate = formatInZone("dd MMMM yyyy", tomorrowCal.time, tz),
+                tomorrowDayOfWeekEnglish = formatInZone("EEEE", tomorrowCal.time, tz),
+                yesterdayFormattedDate = formatInZone("dd MMMM yyyy", yesterdayCal.time, tz)
             )
         }
 
-        fun resolveRelativeDate(offsetDays: Long, zoneOverride: ZoneId? = null): String {
-            val snap = getCurrentSnapshot(zoneOverride)
-            val target = snap.zonedDateTime.plusDays(offsetDays)
-            val dayName = target.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.US)
-            return "${target.format(HUMAN_DATE_FMT)} ($dayName)"
+        fun resolveRelativeDate(offsetDays: Long, zoneOverride: String? = null): String {
+            val tz = resolveEffectiveTimeZone(zoneOverride)
+            val cal = Calendar.getInstance(tz).apply {
+                timeInMillis = currentTimeMillis()
+                add(Calendar.DAY_OF_YEAR, offsetDays.toInt())
+            }
+            val dayName = formatInZone("EEEE", cal.time, tz)
+            return "${formatInZone("dd MMMM yyyy", cal.time, tz)} ($dayName)"
+        }
+
+        private fun resolveKnownOrStandardZone(rawPlace: String, fallback: Pair<String, String>): Pair<String, String> {
+            val clean = rawPlace.trim()
+            val mapped = CITY_COUNTRY_TO_ZONE[clean.lowercase(Locale.US)]
+            if (mapped != null) return mapped
+            val matchedId = TimeZone.getAvailableIDs().firstOrNull { it.equals(clean, ignoreCase = true) }
+            return if (matchedId != null) matchedId to clean else fallback
         }
 
         fun compareTimeZones(placeA: String, placeB: String): TimeZoneComparisonResult {
-            val keyA = placeA.trim().lowercase()
-            val keyB = placeB.trim().lowercase()
-            val (zoneIdA, labelA) = CITY_COUNTRY_TO_ZONE[keyA]
-                ?: runCatching { ZoneId.of(placeA.trim()).id to placeA.trim() }.getOrDefault("Asia/Kolkata" to "India (IST)")
-            val (zoneIdB, labelB) = CITY_COUNTRY_TO_ZONE[keyB]
-                ?: runCatching { ZoneId.of(placeB.trim()).id to placeB.trim() }.getOrDefault("Asia/Dubai" to "Dubai, UAE (GST)")
+            val (zoneIdA, labelA) = resolveKnownOrStandardZone(placeA, "Asia/Kolkata" to "India (IST)")
+            val (zoneIdB, labelB) = resolveKnownOrStandardZone(placeB, "Asia/Dubai" to "Dubai, UAE (GST)")
 
-            val instant = Instant.now(clockProvider)
-            val zdtA = instant.atZone(ZoneId.of(zoneIdA))
-            val zdtB = instant.atZone(ZoneId.of(zoneIdB))
+            val nowMillis = currentTimeMillis()
+            val nowDate = Date(nowMillis)
+            val tzA = TimeZone.getTimeZone(zoneIdA)
+            val tzB = TimeZone.getTimeZone(zoneIdB)
 
-            val offsetSecondsA = zdtA.offset.totalSeconds
-            val offsetSecondsB = zdtB.offset.totalSeconds
-            val diffMinutes = (offsetSecondsA - offsetSecondsB) / 60L
+            val offsetMillisA = tzA.getOffset(nowMillis).toLong()
+            val offsetMillisB = tzB.getOffset(nowMillis).toLong()
+            val diffMinutes = (offsetMillisA - offsetMillisB) / 60_000L
             val absMinutes = abs(diffMinutes)
             val hours = absMinutes / 60
             val minutes = absMinutes % 60
@@ -1002,16 +1040,19 @@ object AstrynPersonalIntelligenceEngine {
                 else -> "$labelA and $labelB are in the **exact same time offset**"
             }
 
+            val timeA12h = formatInZone("hh:mm a", nowDate, tzA)
+            val timeB12h = formatInZone("hh:mm a", nowDate, tzB)
+
             return TimeZoneComparisonResult(
                 zoneAId = zoneIdA,
                 zoneALabel = labelA,
-                zoneATime12h = zdtA.format(TIME_12H_FMT),
+                zoneATime12h = timeA12h,
                 zoneBId = zoneIdB,
                 zoneBLabel = labelB,
-                zoneBTime12h = zdtB.format(TIME_12H_FMT),
+                zoneBTime12h = timeB12h,
                 differenceMinutes = absMinutes,
                 formattedDifference = formattedDiff,
-                summaryExplanation = "$relation. Right now it is **${zdtA.format(TIME_12H_FMT)}** in $labelA and **${zdtB.format(TIME_12H_FMT)}** in $labelB."
+                summaryExplanation = "$relation. Right now it is **$timeA12h** in $labelA and **$timeB12h** in $labelB."
             )
         }
     }
@@ -1470,8 +1511,10 @@ object AstrynPersonalIntelligenceEngine {
                     0 -> "Today ($dateStr)"
                     1 -> "Tomorrow ($dateStr)"
                     else -> runCatching {
-                        val ld = LocalDate.parse(dateStr)
-                        "${ld.dayOfWeek.getDisplayName(TextStyle.SHORT, Locale.US)} ($dateStr)"
+                        val parser = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { isLenient = false }
+                        val parsedDate = parser.parse(dateStr)!!
+                        val shortDay = SimpleDateFormat("EEE", Locale.US).format(parsedDate)
+                        "$shortDay ($dateStr)"
                     }.getOrDefault(dateStr)
                 }
                 DailyWeatherForecastItem(
@@ -1566,7 +1609,7 @@ object AstrynPersonalIntelligenceEngine {
             cityName: String,
             latitude: Double? = null,
             longitude: Double? = null,
-            nowMillis: Long = Instant.now(AstrynTimeIntelligence.clockProvider).toEpochMilli()
+            nowMillis: Long = AstrynTimeIntelligence.currentTimeMillis()
         ): Result<CompleteWeatherBundle> {
             val key = cityName.trim().lowercase()
             val known = AstrynLocationManager.lookupKnownCity(cityName)
@@ -1613,7 +1656,7 @@ object AstrynPersonalIntelligenceEngine {
             userId: String,
             query: String,
             context: Context? = null,
-            nowMillis: Long = Instant.now(AstrynTimeIntelligence.clockProvider).toEpochMilli()
+            nowMillis: Long = AstrynTimeIntelligence.currentTimeMillis()
         ): String {
             val lang = AstrynPersonalizationEngine.detectResponseLanguage(userId, query)
             val locResult = AstrynLocationManager.resolveLocationForWeather(userId, query, context)
@@ -1646,9 +1689,9 @@ object AstrynPersonalIntelligenceEngine {
 
             val lower = query.lowercase()
             val timeSnap = AstrynTimeIntelligence.getCurrentSnapshot()
-            val fetchTimeFormatted = Instant.ofEpochMilli(bundle.fetchedAtMillis)
-                .atZone(timeSnap.zonedDateTime.zone)
-                .format(DateTimeFormatter.ofPattern("dd MMM yyyy, hh:mm a", Locale.US))
+            val fetchTimeFormatted = SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone(timeSnap.timeZoneId)
+            }.format(Date(bundle.fetchedAtMillis))
 
             return buildString {
                 // 1. Offline / Stale cache banner (NEVER present cached weather as live!)
@@ -2238,7 +2281,7 @@ object AstrynPersonalIntelligenceEngine {
         AstrynWeatherIntelligence.clearWeatherCache()
         AstrynWeatherIntelligence.forceOfflineMode = false
         AstrynWeatherIntelligence.weatherGateway = OpenMeteoHttpWeatherGateway
-        AstrynTimeIntelligence.clockProvider = Clock.systemDefaultZone()
+        AstrynTimeIntelligence.resetClockToSystemDefault()
     }
 
     // =========================================================================

@@ -358,7 +358,7 @@ fun LiveGirlfriendVoiceCallScreen(
     remember(callSeconds) {
       val mins = callSeconds / 60
       val secs = callSeconds % 60
-      String.format("%02d:%02d", mins, secs)
+      String.format(java.util.Locale.US, "%02d:%02d", mins, secs)
     }
 
   val infiniteTransition = rememberInfiniteTransition(label = "jarvis_arc_reactor")

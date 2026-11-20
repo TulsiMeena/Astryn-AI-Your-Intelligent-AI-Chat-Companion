@@ -390,7 +390,7 @@ object AstrynIntelligenceEngine {
 
   private val sensitiveValueRegex =
     Regex(
-      "(AIza[0-9A-Za-z\\-_]{20,}|sk-[0-9A-Za-z]{20,}|password\\s*[:=]\\s*\\S+|" +
+      "(AIza[0-9A-Za-z\\-_]{20,}|AQ\\.[0-9A-Za-z\\-_.]{15,}|sk-[0-9A-Za-z]{20,}|password\\s*[:=]\\s*\\S+|" +
         "secret\\s*[:=]\\s*\\S+|bearer\\s+[0-9A-Za-z\\-._~+/]+=*|\\b(?:\\d[ -]*?){13,16}\\b)",
       RegexOption.IGNORE_CASE,
     )

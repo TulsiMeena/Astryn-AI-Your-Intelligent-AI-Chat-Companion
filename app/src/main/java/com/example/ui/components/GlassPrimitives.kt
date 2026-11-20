@@ -613,7 +613,7 @@ fun GlassButton(
           role = Role.Button,
           onClick = onClick,
         )
-        .padding(horizontal = AppSpacing.lg, vertical = AppSpacing.md),
+        .padding(horizontal = AppSpacing.md, vertical = AppSpacing.sm),
     contentAlignment = Alignment.Center,
   ) {
     Row(
@@ -626,7 +626,7 @@ fun GlassButton(
           color = contentColor,
           strokeWidth = 2.dp,
         )
-        Spacer(modifier = Modifier.width(AppSpacing.sm))
+        Spacer(modifier = Modifier.width(6.dp))
       } else if (leadingIcon != null) {
         Icon(
           imageVector = leadingIcon,
@@ -634,7 +634,7 @@ fun GlassButton(
           tint = contentColor,
           modifier = Modifier.size(18.dp),
         )
-        Spacer(modifier = Modifier.width(AppSpacing.sm))
+        Spacer(modifier = Modifier.width(6.dp))
       }
       Text(
         text = text,

@@ -567,6 +567,7 @@ class GeminiLiveVoiceSession(
       sanitized =
         sanitized
           .replace(Regex("""AIza[0-9A-Za-z\-_]{15,60}"""), "AIza••••••••REDACTED")
+          .replace(Regex("""AQ\.[0-9A-Za-z\-_.]{15,140}"""), "AQ.••••••••REDACTED")
           .replace(Regex("""key=[^&\s"']+"""), "key=REDACTED")
       return sanitized.trim()
     }
@@ -1532,6 +1533,7 @@ class GeminiLiveVoiceSession(
     val request =
       Request.Builder()
         .url("$LIVE_WS_ENDPOINT?key=$apiKey")
+        .addHeader("x-goog-api-key", apiKey)
         .build()
 
     webSocket =

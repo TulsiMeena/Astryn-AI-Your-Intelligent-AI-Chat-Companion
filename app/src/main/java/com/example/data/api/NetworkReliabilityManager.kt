@@ -89,6 +89,7 @@ object SafeDiagnosticLogger {
   private val KEY_QUERY_REGEX =
     Regex("""([?&](?:key|api_key|token|access_token)=)[^&\s"]+""", RegexOption.IGNORE_CASE)
   private val GOOGLE_API_KEY_REGEX = Regex("""AIza[0-9A-Za-z\-_]{15,}""")
+  private val GOOGLE_AQ_API_KEY_REGEX = Regex("""AQ\.[0-9A-Za-z\-_.]{15,}""")
   private val SK_KEY_REGEX = Regex("""\bsk-[A-Za-z0-9\-_]{16,}\b""")
   private val GOOG_HEADER_REGEX =
     Regex("""(x-goog-api-key\s*[:=]\s*)[^\s,"']+""", RegexOption.IGNORE_CASE)
@@ -110,6 +111,7 @@ object SafeDiagnosticLogger {
         .replace("[REDACTED_TOKEN]", "SAFE_VAL")
         .replace("[REDACTED_SECRET]", "SAFE_VAL")
     return GOOGLE_API_KEY_REGEX.containsMatchIn(withoutRedactedMarkers) ||
+      GOOGLE_AQ_API_KEY_REGEX.containsMatchIn(withoutRedactedMarkers) ||
       SK_KEY_REGEX.containsMatchIn(withoutRedactedMarkers) ||
       BEARER_TOKEN_REGEX.containsMatchIn(withoutRedactedMarkers) ||
       GOOG_HEADER_REGEX.containsMatchIn(withoutRedactedMarkers) ||
@@ -125,6 +127,7 @@ object SafeDiagnosticLogger {
       .replace(KEY_QUERY_REGEX, "$1[REDACTED]")
       .replace(GOOG_HEADER_REGEX, "$1[REDACTED]")
       .replace(GOOGLE_API_KEY_REGEX, "[REDACTED_API_KEY]")
+      .replace(GOOGLE_AQ_API_KEY_REGEX, "[REDACTED_API_KEY]")
       .replace(SK_KEY_REGEX, "[REDACTED_API_KEY]")
       .replace(BEARER_TOKEN_REGEX, "$1[REDACTED_TOKEN]")
   }

@@ -33,7 +33,7 @@
             android:paddingVertical="3dp"
             android:text="ONLINE"
             android:textColor="#00F2FE"
-            android:textSize="10sp"
+            android:textSize="11sp"
             android:textStyle="bold" />
     </LinearLayout>
 
@@ -58,6 +58,7 @@
             android:id="@+id/widget_btn_aanya"
             android:layout_width="0dp"
             android:layout_height="40dp"
+            android:layout_marginEnd="8dp"
             android:layout_weight="1"
             android:background="@drawable/widget_button_pink"
             android:gravity="center"
@@ -66,15 +67,12 @@
             android:textSize="11.5sp"
             android:textStyle="bold" />
 
-        <Space
-            android:layout_width="8dp"
-            android:layout_height="wrap_content" />
-
         <!-- Voice Mic Button -->
         <TextView
             android:id="@+id/widget_btn_mic"
             android:layout_width="0dp"
             android:layout_height="40dp"
+            android:layout_marginEnd="8dp"
             android:layout_weight="1"
             android:background="@drawable/widget_button_glass"
             android:gravity="center"
@@ -82,10 +80,6 @@
             android:textColor="#00F2FE"
             android:textSize="11.5sp"
             android:textStyle="bold" />
-
-        <Space
-            android:layout_width="8dp"
-            android:layout_height="wrap_content" />
 
         <!-- New Chat Button -->
         <TextView

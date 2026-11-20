@@ -1033,6 +1033,7 @@ fun AuthScreen(
                               FirebaseRestAuthClient.sendVerificationEmailToUser(
                                 idToken = pendingVerificationIdToken,
                                 email = pendingVerificationEmail,
+                                uid = pendingVerificationUid,
                               )
                             isResendingVerification = false
                             resendRes

@@ -362,4 +362,70 @@ class AstrynAuthHistoryIsolationTest {
     composeTestRule.onNodeWithText("three.user@gmail.com").assertExists()
     composeTestRule.onNodeWithText("am7620711@gmail.com").assertDoesNotExist()
   }
+
+  @Test
+  fun testVerificationEmailDistinguishesMissingSessionTokenFromMissingFirebaseKey() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val singletonPrefs = UserPreferencesRepository.getInstance(context)
+    val previousKey = singletonPrefs.preferencesFlow.value.firebaseWebApiKey
+    try {
+      singletonPrefs.updateFirebaseWebApiKey("AIzaSyTestFirebaseWebApiKeyForVerification12345")
+      val res =
+        FirebaseRestAuthClient.sendVerificationEmailToUser(
+          idToken = "",
+          email = "amit.test.user@gmail.com",
+          uid = "uid_test_user",
+        )
+      assertTrue(res.isFailure)
+      val errMsg = res.exceptionOrNull()?.message.orEmpty()
+      assertFalse(
+        "Should NOT report FIREBASE_KEY_MISSING when Firebase Web API Key IS configured",
+        errMsg.contains("FIREBASE_KEY_MISSING"),
+      )
+      assertTrue(
+        "Should report SESSION_TOKEN_MISSING when idToken is blank and refreshToken unavailable",
+        errMsg.contains("SESSION_TOKEN_MISSING"),
+      )
+    } finally {
+      singletonPrefs.updateFirebaseWebApiKey(previousKey)
+    }
+  }
+
+  @Test
+  fun testPasswordAndEmailChangeFailCleanlyWithoutFalseSuccess() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val singletonPrefs = UserPreferencesRepository.getInstance(context)
+    val previousKey = singletonPrefs.preferencesFlow.value.firebaseWebApiKey
+    try {
+      singletonPrefs.updateFirebaseWebApiKey("AIzaSyTestFirebaseWebApiKeyForUpdate12345")
+
+      val passRes =
+        FirebaseRestAuthClient.changeUserPasswordInCloud(
+          idToken = "",
+          email = "amit.test.user@gmail.com",
+          newPassword = "StrongPassword#2026",
+          uid = "uid_test_user",
+        )
+      assertTrue("Password update must fail without active Firebase token", passRes.isFailure)
+      assertTrue(
+        passRes.exceptionOrNull()?.message.orEmpty().contains("SESSION_TOKEN_MISSING")
+      )
+
+      val emailRes =
+        FirebaseRestAuthClient.changeUserEmailInCloud(
+          uid = "uid_test_user",
+          idToken = "",
+          newEmail = "amit.new.user@gmail.com",
+          name = "Amit User",
+          roleBadge = "Developer",
+          provider = "Email",
+        )
+      assertTrue("Email update must fail without active Firebase token", emailRes.isFailure)
+      assertTrue(
+        emailRes.exceptionOrNull()?.message.orEmpty().contains("SESSION_TOKEN_MISSING")
+      )
+    } finally {
+      singletonPrefs.updateFirebaseWebApiKey(previousKey)
+    }
+  }
 }

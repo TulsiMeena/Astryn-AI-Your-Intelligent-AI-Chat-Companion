@@ -1724,13 +1724,37 @@ object FirebaseRestAuthClient {
         return@withContext Result.failure(IllegalArgumentException(emailCheck.statusMessage))
       }
 
-      var refreshedIdToken = idToken
       val apiKey = resolveConfiguredApiKeyWithAutoDiscovery()
-      if (apiKey != null && idToken.isNotBlank()) {
-        try {
+      if (apiKey == null) {
+        return@withContext Result.failure(
+          IllegalStateException(
+            "FIREBASE_KEY_MISSING: Email update karne ke liye apna Firebase Web API Key (AIzaSy...) paste karein."
+          )
+        )
+      }
+
+      val (initialToken, candidateRefresh) =
+        resolveFreshIdTokenForUser(
+          apiKey = apiKey,
+          providedIdToken = idToken,
+          cleanEmail = "",
+          uid = uid,
+        )
+      var activeToken = initialToken
+      if (activeToken.isBlank()) {
+        return@withContext Result.failure(
+          IllegalStateException(
+            "SESSION_TOKEN_MISSING: Email ID change karne ke liye ek baar Sign Out karke dubara Sign In karein."
+          )
+        )
+      }
+
+      var refreshedIdToken = activeToken
+      try {
+        suspend fun executeEmailUpdate(tokenToUse: String): Pair<Boolean, String> {
           val payload =
             JSONObject().apply {
-              put("idToken", idToken)
+              put("idToken", tokenToUse)
               put("email", cleanEmail)
               put("returnSecureToken", true)
             }
@@ -1739,22 +1763,47 @@ object FirebaseRestAuthClient {
               .url("https://identitytoolkit.googleapis.com/v1/accounts:update?key=$apiKey")
               .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
               .build()
-          httpClient.newCall(req).execute().use { resp ->
-            val bodyStr = resp.body?.string().orEmpty()
-            if (resp.isSuccessful && bodyStr.isNotBlank()) {
-              val json = JSONObject(bodyStr)
-              val nextToken = json.optString("idToken", "")
-              if (nextToken.isNotBlank()) {
-                refreshedIdToken = nextToken
-                sendEmailVerificationLink(apiKey = apiKey, idToken = nextToken)
-              }
-            } else if (!resp.isSuccessful && bodyStr.contains("EMAIL_EXISTS", ignoreCase = true)) {
-              return@withContext Result.failure(
-                IllegalStateException("This Email ID is already linked to another account in Firebase ($PROJECT_ID).")
-              )
-            }
+          return httpClient.newCall(req).execute().use { resp ->
+            resp.isSuccessful to resp.body?.string().orEmpty()
           }
-        } catch (_: Exception) {}
+        }
+
+        var (ok, bodyStr) = executeEmailUpdate(activeToken)
+        if (
+          !ok &&
+            candidateRefresh.isNotBlank() &&
+            (bodyStr.contains("INVALID_ID_TOKEN", ignoreCase = true) ||
+              bodyStr.contains("TOKEN_EXPIRED", ignoreCase = true))
+        ) {
+          val refreshed = refreshFirebaseIdToken(apiKey, candidateRefresh)
+          if (refreshed != null) {
+            activeToken = refreshed.first
+            val retryResult = executeEmailUpdate(activeToken)
+            ok = retryResult.first
+            bodyStr = retryResult.second
+          }
+        }
+
+        if (!ok) {
+          return@withContext Result.failure(
+            IllegalStateException(mapAccountUpdateFailureMessage(bodyStr, isEmailChange = true))
+          )
+        }
+
+        if (bodyStr.isNotBlank()) {
+          val json = JSONObject(bodyStr)
+          val nextToken = json.optString("idToken", "").trim()
+          if (nextToken.isNotBlank()) {
+            refreshedIdToken = nextToken
+            sendEmailVerificationLink(apiKey = apiKey, idToken = nextToken)
+          }
+        }
+      } catch (e: Exception) {
+        return@withContext Result.failure(
+          IllegalStateException(
+            "Unable to update Email ID in Firebase ($PROJECT_ID): ${e.localizedMessage ?: "Network error"}"
+          )
+        )
       }
 
       syncProfileToFirestore(
@@ -1773,9 +1822,7 @@ object FirebaseRestAuthClient {
         roleBadge = roleBadge,
         provider = provider,
       )
-      Result.success(
-        cleanEmail to refreshedIdToken
-      )
+      Result.success(cleanEmail to refreshedIdToken)
     }
 
   /**
@@ -1785,6 +1832,7 @@ object FirebaseRestAuthClient {
     idToken: String,
     email: String,
     newPassword: String,
+    uid: String = "",
   ): Result<Pair<String, String>> =
     withContext(Dispatchers.IO) {
       val passwordError =
@@ -1798,12 +1846,36 @@ object FirebaseRestAuthClient {
       }
 
       val apiKey = resolveConfiguredApiKeyWithAutoDiscovery()
-      var refreshedToken = idToken
-      if (apiKey != null && idToken.isNotBlank()) {
-        try {
+      if (apiKey == null) {
+        return@withContext Result.failure(
+          IllegalStateException(
+            "FIREBASE_KEY_MISSING: Password change karne ke liye apna Firebase Web API Key (AIzaSy...) paste karein."
+          )
+        )
+      }
+
+      val (initialToken, candidateRefresh) =
+        resolveFreshIdTokenForUser(
+          apiKey = apiKey,
+          providedIdToken = idToken,
+          cleanEmail = email.trim().lowercase(),
+          uid = uid,
+        )
+      var activeToken = initialToken
+      if (activeToken.isBlank()) {
+        return@withContext Result.failure(
+          IllegalStateException(
+            "SESSION_TOKEN_MISSING: Security ke liye ek baar Sign Out karke dubara Sign In karein, fir password change karein."
+          )
+        )
+      }
+
+      var refreshedToken = activeToken
+      try {
+        suspend fun executePasswordUpdate(tokenToUse: String): Pair<Boolean, String> {
           val payload =
             JSONObject().apply {
-              put("idToken", idToken)
+              put("idToken", tokenToUse)
               put("password", newPassword)
               put("returnSecureToken", true)
             }
@@ -1812,27 +1884,163 @@ object FirebaseRestAuthClient {
               .url("https://identitytoolkit.googleapis.com/v1/accounts:update?key=$apiKey")
               .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
               .build()
-          httpClient.newCall(req).execute().use { resp ->
-            val bodyStr = resp.body?.string().orEmpty()
-            if (resp.isSuccessful && bodyStr.isNotBlank()) {
-              val json = JSONObject(bodyStr)
-              val nextToken = json.optString("idToken", "")
-              if (nextToken.isNotBlank()) {
-                refreshedToken = nextToken
-              }
-            }
+          return httpClient.newCall(req).execute().use { resp ->
+            resp.isSuccessful to resp.body?.string().orEmpty()
           }
-        } catch (_: Exception) {}
+        }
+
+        var (ok, bodyStr) = executePasswordUpdate(activeToken)
+        if (
+          !ok &&
+            candidateRefresh.isNotBlank() &&
+            (bodyStr.contains("INVALID_ID_TOKEN", ignoreCase = true) ||
+              bodyStr.contains("TOKEN_EXPIRED", ignoreCase = true))
+        ) {
+          val refreshed = refreshFirebaseIdToken(apiKey, candidateRefresh)
+          if (refreshed != null) {
+            activeToken = refreshed.first
+            refreshedToken = activeToken
+            val retryResult = executePasswordUpdate(activeToken)
+            ok = retryResult.first
+            bodyStr = retryResult.second
+          }
+        }
+
+        if (!ok) {
+          return@withContext Result.failure(
+            IllegalStateException(mapAccountUpdateFailureMessage(bodyStr, isEmailChange = false))
+          )
+        }
+
+        if (bodyStr.isNotBlank()) {
+          val json = JSONObject(bodyStr)
+          val nextToken = json.optString("idToken", "").trim()
+          if (nextToken.isNotBlank()) {
+            refreshedToken = nextToken
+          }
+        }
+      } catch (e: Exception) {
+        return@withContext Result.failure(
+          IllegalStateException(
+            "Unable to update password in Firebase ($PROJECT_ID): ${e.localizedMessage ?: "Network error"}"
+          )
+        )
       }
+
       Result.success(
         "Password updated & encrypted in Firebase Auth ($PROJECT_ID) ✓" to refreshedToken
       )
     }
 
+  private fun mapAccountUpdateFailureMessage(rawBody: String, isEmailChange: Boolean): String {
+    return when {
+      rawBody.contains("EMAIL_EXISTS", ignoreCase = true) ->
+        "This Email ID is already linked to another account in Firebase ($PROJECT_ID)."
+      rawBody.contains("CREDENTIAL_TOO_OLD_LOGIN_AGAIN", ignoreCase = true) ||
+        rawBody.contains("REQUIRES_RECENT_LOGIN", ignoreCase = true) ->
+        if (isEmailChange) {
+          "Security check: Email ID badalne ke liye ek baar Sign Out karke dubara Sign In karein."
+        } else {
+          "Security check: Password change karne ke liye ek baar Sign Out karke dubara Sign In karein, ya 'Reset via Email' button use karein."
+        }
+      rawBody.contains("WEAK_PASSWORD", ignoreCase = true) ->
+        "Password is too weak. Please use at least 8 characters with letters and numbers/symbols."
+      rawBody.contains("INVALID_EMAIL", ignoreCase = true) ->
+        "Please enter a valid Email ID."
+      rawBody.contains("INVALID_ID_TOKEN", ignoreCase = true) ||
+        rawBody.contains("TOKEN_EXPIRED", ignoreCase = true) ->
+        "SESSION_TOKEN_MISSING: Session expire ho gaya hai. Ek baar Sign Out karke dubara Sign In karein."
+      else -> parseFirebaseAuthError(rawBody, isSignUp = false)
+    }
+  }
+
+  private fun resolveFreshIdTokenForUser(
+    apiKey: String,
+    providedIdToken: String,
+    cleanEmail: String,
+    uid: String = "",
+  ): Pair<String, String> {
+    val cleanProvided = providedIdToken.trim()
+    val prefsRepo =
+      try {
+        com.example.data.repository.UserPreferencesRepository.getInstance()
+      } catch (_: Exception) {
+        null
+      }
+    val prefs = prefsRepo?.preferencesFlow?.value
+    val matchingAccount =
+      prefs?.knownAccounts?.firstOrNull { account ->
+        (uid.isNotBlank() && account.canonicalUid == uid) ||
+          (cleanEmail.isNotBlank() && account.email.equals(cleanEmail, ignoreCase = true))
+      }
+    val candidateRefresh =
+      prefs?.authRefreshToken?.trim()?.takeIf { it.isNotBlank() }
+        ?: matchingAccount?.refreshToken?.trim()?.takeIf { it.isNotBlank() }
+        ?: if (cleanEmail.isNotBlank()) prefsRepo?.getRefreshTokenForEmail(cleanEmail).orEmpty().trim() else ""
+
+    if (cleanProvided.isNotBlank()) {
+      return cleanProvided to candidateRefresh
+    }
+    if (apiKey.isBlank()) {
+      return "" to candidateRefresh
+    }
+
+    if (candidateRefresh.isNotBlank()) {
+      val refreshed = refreshFirebaseIdToken(apiKey, candidateRefresh)
+      if (refreshed != null) {
+        return refreshed.first to refreshed.second
+      }
+    }
+
+    // If user previously entered via Google 1-Tap local fallback while FIREBASE_WEB_API_KEY
+    // was missing, silently obtain their Firebase Auth token now that the key is configured.
+    val provider =
+      matchingAccount?.provider?.ifBlank { prefs?.authProvider.orEmpty() }
+        ?: prefs?.authProvider.orEmpty()
+    if (cleanEmail.isNotBlank() && provider.equals("Google", ignoreCase = true)) {
+      val derivedGooglePass = "GAuth!9#${cleanEmail.hashCode().toUInt()}Xz"
+      for (endpoint in listOf("accounts:signInWithPassword", "accounts:signUp")) {
+        try {
+          val payload =
+            JSONObject().apply {
+              put("email", cleanEmail)
+              put("password", derivedGooglePass)
+              put("returnSecureToken", true)
+            }
+          val req =
+            Request.Builder()
+              .url("https://identitytoolkit.googleapis.com/v1/$endpoint?key=$apiKey")
+              .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+              .build()
+          httpClient.newCall(req).execute().use { resp ->
+            val bodyStr = resp.body?.string().orEmpty()
+            if (resp.isSuccessful && bodyStr.isNotBlank()) {
+              val json = JSONObject(bodyStr)
+              val newToken = json.optString("idToken", "").trim()
+              val newRefresh = json.optString("refreshToken", "").trim()
+              if (newToken.isNotBlank()) {
+                try {
+                  prefsRepo?.updateAuthIdToken(newIdToken = newToken, newRefreshToken = newRefresh)
+                } catch (_: Exception) {}
+                return newToken to newRefresh
+              }
+            }
+          }
+        } catch (_: Exception) {}
+      }
+    }
+
+    return "" to candidateRefresh
+  }
+
   /**
    * Dispatches a verification email to the currently authenticated user.
    */
-  suspend fun sendVerificationEmailToUser(idToken: String, email: String): Result<String> =
+  suspend fun sendVerificationEmailToUser(
+    idToken: String,
+    email: String,
+    uid: String = "",
+  ): Result<String> =
     withContext(Dispatchers.IO) {
       val cleanEmail = email.trim().lowercase()
       val check = EmailSecurityValidator.validateEmail(cleanEmail)
@@ -1840,14 +2048,43 @@ object FirebaseRestAuthClient {
         return@withContext Result.failure(IllegalArgumentException(check.statusMessage))
       }
       val apiKey = resolveConfiguredApiKeyWithAutoDiscovery()
-      if (apiKey == null || idToken.isBlank()) {
+      if (apiKey == null) {
         return@withContext Result.failure(
           IllegalStateException(
             "FIREBASE_KEY_MISSING: Verification link bhejne ke liye Firebase Web API Key (AIzaSy...) required hai."
           )
         )
       }
-      val sendRes = sendEmailVerificationLinkWithResult(apiKey = apiKey, idToken = idToken)
+
+      val (activeToken, candidateRefresh) =
+        resolveFreshIdTokenForUser(
+          apiKey = apiKey,
+          providedIdToken = idToken,
+          cleanEmail = cleanEmail,
+          uid = uid,
+        )
+      if (activeToken.isBlank()) {
+        return@withContext Result.failure(
+          IllegalStateException(
+            "SESSION_TOKEN_MISSING: Verification link bhejne ke liye ek baar Sign Out karke apni Email ya Google account se dubara Sign In karein."
+          )
+        )
+      }
+
+      var sendRes = sendEmailVerificationLinkWithResult(apiKey = apiKey, idToken = activeToken)
+      if (sendRes.isFailure && candidateRefresh.isNotBlank()) {
+        val errMsg = sendRes.exceptionOrNull()?.message.orEmpty()
+        if (
+          errMsg.contains("INVALID_ID_TOKEN", ignoreCase = true) ||
+            errMsg.contains("TOKEN_EXPIRED", ignoreCase = true)
+        ) {
+          val refreshed = refreshFirebaseIdToken(apiKey, candidateRefresh)
+          if (refreshed != null) {
+            sendRes = sendEmailVerificationLinkWithResult(apiKey = apiKey, idToken = refreshed.first)
+          }
+        }
+      }
+
       if (sendRes.isSuccess) {
         Result.success("Verification link sent to $cleanEmail! Check your Inbox or Spam folder.")
       } else {

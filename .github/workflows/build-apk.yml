@@ -63,6 +63,20 @@ jobs:
           fi
           echo "Confirmed ./debug.keystore is present."
 
+      - name: Configure .env from GitHub Secrets (if provided)
+        env:
+          FIREBASE_WEB_API_KEY: ${{ secrets.FIREBASE_WEB_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -n "${FIREBASE_WEB_API_KEY}" ] || [ -n "${GEMINI_API_KEY}" ]; then
+            : > .env
+            [ -n "${FIREBASE_WEB_API_KEY}" ] && echo "FIREBASE_WEB_API_KEY=${FIREBASE_WEB_API_KEY}" >> .env
+            [ -n "${GEMINI_API_KEY}" ] && echo "GEMINI_API_KEY=${GEMINI_API_KEY}" >> .env
+            echo "Configured .env keys from GitHub Secrets."
+          else
+            echo "No GitHub Secrets configured for .env; continuing with defaults."
+          fi
+
       - name: Build Debug APK
         run: gradle :app:assembleDebug --stacktrace --no-daemon
 

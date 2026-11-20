@@ -1242,11 +1242,7 @@ object AttachmentProcessor {
   }
 
   private fun encodeBase64NoWrap(bytes: ByteArray): String {
-    return try {
-      java.util.Base64.getEncoder().encodeToString(bytes)
-    } catch (_: Throwable) {
-      android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-    }
+    return UserApiKeyManager.encodeBase64(bytes)
   }
 
   private fun scaleBitmapDownIfNeeded(source: Bitmap, maxDimension: Int): Bitmap {
