@@ -88,10 +88,9 @@ class ChatViewModel(
   private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
 
-  private val enableJarvisResilience: Boolean =
-    ioDispatcher === Dispatchers.IO &&
-      connectivityMonitor === NetworkConnectivityMonitor.getInstance() &&
-      apiKeyManager === UserApiKeyManager.getInstance()
+  // Never silently substitute fake/hardcoded local replies for real Gemini API errors or missing keys.
+  private val enableJarvisResilience: Boolean = false
+  private val enableStreamingFrameThrottle: Boolean = ioDispatcher === Dispatchers.IO
 
   companion object {
     private const val MAX_TRACKED_INITIAL_PROMPTS = 64
@@ -859,7 +858,7 @@ class ChatViewModel(
       }
     }
 
-    val useJarvisFallback = liveVoiceMood != null || enableJarvisResilience
+    val useJarvisFallback = enableJarvisResilience
 
     // 1. Check API Key before making network request
     if (!isApiKeyAvailable()) {
@@ -1046,10 +1045,9 @@ class ChatViewModel(
                 diagnosticSummary = "Generation error: ${throwable.message}",
               )
               val allowLocalVoiceFallback =
-                liveVoiceMood != null ||
-                  (useJarvisFallback &&
-                    throwable !is GeminiException.SafetyBlocked &&
-                    throwable !is GeminiException.ContextLengthExceeded)
+                useJarvisFallback &&
+                  throwable !is GeminiException.SafetyBlocked &&
+                  throwable !is GeminiException.ContextLengthExceeded
 
               if (apiKeyManager.hasSavedKey() || !allowLocalVoiceFallback) {
                 apiKeyManager.recordConnectionFailure(
@@ -1151,7 +1149,7 @@ class ChatViewModel(
               accumulatedText.append(chunk)
               val nowMs = System.nanoTime() / 1_000_000L
               val shouldEmitFrame =
-                !enableJarvisResilience ||
+                !enableStreamingFrameThrottle ||
                   lastUiEmitTimeMs == 0L ||
                   (nowMs - lastUiEmitTimeMs) >= 16L
               if (shouldEmitFrame) {

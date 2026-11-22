@@ -86,6 +86,10 @@ object FirebaseRestAuthClient {
   @Volatile private var cachedAutoDiscoveredApiKey: String? = null
   private val FIREBASE_API_KEY_REGEX = Regex("""AIza[0-9A-Za-z\-_]{25,60}""")
 
+  internal fun resetCachedKeyForTesting() {
+    cachedAutoDiscoveredApiKey = null
+  }
+
   /**
    * Extracts a valid `AIza...` Firebase Web API key from either a raw key string
    * or a pasted `firebaseConfig = { apiKey: "AIza...", ... }` code block.
@@ -137,15 +141,8 @@ object FirebaseRestAuthClient {
     // 3. Check cached auto-discovered key from Firebase Hosting init.json
     cachedAutoDiscoveredApiKey?.takeIf { it.isNotBlank() }?.let { return it }
 
-    // 4. Fallback check: UserApiKeyManager if user saved an AIza... Google Cloud / Firebase key
-    val savedGoogleKey =
-      try {
-        com.example.data.local.UserApiKeyManager.getInstance().getDecryptedApiKey().orEmpty().trim()
-      } catch (_: Exception) {
-        ""
-      }
-    extractApiKeyFromSnippet(savedGoogleKey)?.let { return it }
-
+    // Do NOT reuse UserApiKeyManager's Google AI Studio / Vertex Gemini key here:
+    // Gemini API keys belong to a separate GCP project and fail against Firebase Auth (`sms-send-e2ad8`).
     return null
   }
 
@@ -162,30 +159,37 @@ object FirebaseRestAuthClient {
           "https://$AUTH_DOMAIN/__/firebase/init.json",
           "https://$PROJECT_ID.web.app/__/firebase/init.json",
         )
-      for (url in candidateUrls) {
-        try {
-          val req = Request.Builder().url(url).get().build()
-          httpClient.newCall(req).execute().use { resp ->
-            if (resp.isSuccessful) {
-              val body = resp.body?.string().orEmpty()
-              val key =
-                try {
-                  JSONObject(body).optString("apiKey", "").trim()
-                } catch (_: Exception) {
-                  extractApiKeyFromSnippet(body).orEmpty()
+      repeat(2) { attemptIdx ->
+        for (url in candidateUrls) {
+          try {
+            val req = Request.Builder().url(url).get().build()
+            httpClient.newCall(req).execute().use { resp ->
+              if (resp.isSuccessful) {
+                val body = resp.body?.string().orEmpty()
+                val key =
+                  try {
+                    JSONObject(body).optString("apiKey", "").trim()
+                  } catch (_: Exception) {
+                    extractApiKeyFromSnippet(body).orEmpty()
+                  }
+                if (key.startsWith("AIza") && key.length >= 25) {
+                  cachedAutoDiscoveredApiKey = key
+                  try {
+                    com.example.data.repository.UserPreferencesRepository
+                      .getInstance()
+                      .updateFirebaseWebApiKey(key)
+                  } catch (_: Exception) {}
+                  return@withContext key
                 }
-              if (key.startsWith("AIza") && key.length >= 25) {
-                cachedAutoDiscoveredApiKey = key
-                try {
-                  com.example.data.repository.UserPreferencesRepository
-                    .getInstance()
-                    .updateFirebaseWebApiKey(key)
-                } catch (_: Exception) {}
-                return@withContext key
               }
             }
-          }
-        } catch (_: Exception) {}
+          } catch (_: Exception) {}
+        }
+        if (attemptIdx == 0) {
+          try {
+            kotlinx.coroutines.delay(350L)
+          } catch (_: Exception) {}
+        }
       }
       null
     }
@@ -1098,8 +1102,10 @@ object FirebaseRestAuthClient {
 
       val apiKey = resolveConfiguredApiKeyWithAutoDiscovery()
       if (apiKey == null) {
-        return@withContext Result.success(
-          "Password recovery link queued for $cleanEmail ($PROJECT_ID)."
+        return@withContext Result.failure(
+          IllegalStateException(
+            "FIREBASE_KEY_MISSING: Password reset link bhejne ke liye Firebase Web API Key (AIzaSy...) required hai."
+          )
         )
       }
 
@@ -2071,7 +2077,16 @@ object FirebaseRestAuthClient {
         )
       }
 
-      var sendRes = sendEmailVerificationLinkWithResult(apiKey = apiKey, idToken = activeToken)
+      var effectiveToken = activeToken
+      // Check current Firebase verification status first so already-verified users get immediate confirmation
+      // without triggering unnecessary rate-limited `sendOobCode` calls.
+      if (lookupEmailVerifiedInFirebase(apiKey = apiKey, idToken = effectiveToken)) {
+        return@withContext Result.success(
+          "Your email ($cleanEmail) is already verified ✓"
+        )
+      }
+
+      var sendRes = sendEmailVerificationLinkWithResult(apiKey = apiKey, idToken = effectiveToken)
       if (sendRes.isFailure && candidateRefresh.isNotBlank()) {
         val errMsg = sendRes.exceptionOrNull()?.message.orEmpty()
         if (
@@ -2080,7 +2095,18 @@ object FirebaseRestAuthClient {
         ) {
           val refreshed = refreshFirebaseIdToken(apiKey, candidateRefresh)
           if (refreshed != null) {
-            sendRes = sendEmailVerificationLinkWithResult(apiKey = apiKey, idToken = refreshed.first)
+            effectiveToken = refreshed.first
+            try {
+              com.example.data.repository.UserPreferencesRepository
+                .getInstance()
+                .updateAuthIdToken(newIdToken = refreshed.first, newRefreshToken = refreshed.second)
+            } catch (_: Exception) {}
+            if (lookupEmailVerifiedInFirebase(apiKey = apiKey, idToken = effectiveToken)) {
+              return@withContext Result.success(
+                "Your email ($cleanEmail) is already verified ✓"
+              )
+            }
+            sendRes = sendEmailVerificationLinkWithResult(apiKey = apiKey, idToken = effectiveToken)
           }
         }
       }

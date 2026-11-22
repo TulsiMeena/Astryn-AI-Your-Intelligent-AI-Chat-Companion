@@ -1400,11 +1400,24 @@ class GeminiLiveVoiceSession(
       if (
         lower.contains("who are you") ||
           lower.contains("what is your name") ||
+          lower.contains("what's your name") ||
+          lower.contains("whats your name") ||
+          lower.contains("your name") ||
           lower.contains("tum kaun ho") ||
           lower.contains("aap kaun ho") ||
-          lower.contains("tumhara naam kya hai")
+          lower.contains("tu kaun hai") ||
+          lower.contains("tumhara naam") ||
+          lower.contains("tumhara nam") ||
+          lower.contains("aapka naam") ||
+          lower.contains("apka naam") ||
+          lower.contains("apna naam") ||
+          lower.contains("tera naam") ||
+          lower.contains("naam kya") ||
+          lower.contains("name kya") ||
+          lower.contains("तुम्हारा नाम") ||
+          lower.contains("आपका नाम")
       ) {
-        return "Main **Astryn AI** hoon bro — tumhari all-round AI partner! Chahe masti-majak aur chill baat karni ho, coding aur math solve karna ho, ya upar **Live Voice** दबाकर Aanya से आवाज़ में बात करनी हो — main har vibe ke liye ready hoon."
+        return "Mera naam **Astryn** hai, bro! Main **ATSYN AI** (Astryn AI) ka assistant hoon. Batao, aaj main tumhari kya madad kar sakta hoon?"
       }
 
       // 11. Distinguish Casual Conversational Statements from Real Questions
@@ -1504,7 +1517,10 @@ class GeminiLiveVoiceSession(
         return
       }
 
-    if (apiKey.isEmpty()) {
+    if (apiKey.isEmpty() || GeminiService.isVertexExpressApiKey(apiKey)) {
+      // Vertex AI Express Mode (`AQ.…`) keys use REST on `aiplatform.googleapis.com` rather than
+      // AI Studio's `generativelanguage.googleapis.com` BidiGenerateContent WebSocket; switch
+      // immediately to the Device SpeechRecognizer + Gemini REST + Android TTS voice pipeline.
       activateFallbackDeviceVoiceMode()
       return
     }

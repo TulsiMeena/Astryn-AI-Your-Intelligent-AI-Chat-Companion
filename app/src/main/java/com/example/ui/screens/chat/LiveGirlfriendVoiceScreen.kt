@@ -55,6 +55,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -133,33 +134,52 @@ fun LiveGirlfriendVoiceCallScreen(
   var callSeconds by remember { mutableIntStateOf(0) }
   var permissionFeedbackMessage by remember { mutableStateOf<String?>(null) }
 
+  val latestSelectedMood by rememberUpdatedState(selectedMood)
+  val latestIsListeningVoice by rememberUpdatedState(isListeningVoice)
+  val latestIsGenerating by rememberUpdatedState(isGenerating)
+  val latestIsSpeakingVoice by rememberUpdatedState(isSpeakingVoice)
+  val latestOnNativeAudioActiveChanged by rememberUpdatedState(onNativeAudioActiveChanged)
+  val latestOnStopFallbackTts by rememberUpdatedState(onStopFallbackTts)
+  val latestOnSpeakFallbackTts by rememberUpdatedState(onSpeakFallbackTts)
+  val latestOnUserTranscriptFromWs by rememberUpdatedState(onUserTranscriptFromWs)
+  val latestOnSelectMood by rememberUpdatedState(onSelectMood)
+  val latestOnToggleTalkMic by rememberUpdatedState(onToggleTalkMic)
+
   // Real-time Bidirectional Gemini Live WebSocket + AudioRecord/AudioTrack session
   val liveWsSession = remember {
     GeminiLiveVoiceSession(
       onNativeAudioPlayingChanged = { isPlayingNative ->
-        onNativeAudioActiveChanged(isPlayingNative)
+        latestOnNativeAudioActiveChanged(isPlayingNative)
         if (isPlayingNative) {
-          onStopFallbackTts()
+          latestOnStopFallbackTts()
         }
       },
       onUserTranscriptDelta = { userTranscript ->
-        onUserTranscriptFromWs(userTranscript)
+        latestOnUserTranscriptFromWs(userTranscript)
       },
       onLiveTurnCompleteWithAudioFlag = { completedText, playedNativeAudio ->
         if (!playedNativeAudio && completedText.isNotBlank()) {
-          onSpeakFallbackTts(completedText, selectedMood)
+          latestOnSpeakFallbackTts(completedText, latestSelectedMood)
         }
       },
       onInterrupted = {
-        onStopFallbackTts()
+        latestOnStopFallbackTts()
       },
       onMoodChangedByTool = { toolMood ->
-        onSelectMood(toolMood)
+        latestOnSelectMood(toolMood)
       },
       onFallbackToDeviceVoiceRequested = {
         mainHandler.post {
-          if (!isListeningVoice) {
-            onToggleTalkMic()
+          val hasAudioPerm =
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+              PackageManager.PERMISSION_GRANTED
+          if (
+            hasAudioPerm &&
+              !latestIsListeningVoice &&
+              !latestIsGenerating &&
+              !latestIsSpeakingVoice
+          ) {
+            latestOnToggleTalkMic()
           }
         }
       },

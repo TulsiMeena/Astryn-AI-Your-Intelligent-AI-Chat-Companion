@@ -660,15 +660,16 @@ fun AiProviderApiKeyPanel(
               GeminiService.hasBuiltInPlatformKey()) &&
               configState.connectionStatus != ApiConnectionStatus.TESTING,
           onClick = {
+            val testingUnsavedDraft = draftApiKey.trim().isNotEmpty()
             val candidateKey =
-              if (draftApiKey.trim().isNotEmpty()) {
-                val formatCheck = UserApiKeyManager.validateKeyFormat(draftApiKey.trim())
+              if (testingUnsavedDraft) {
+                val formatCheck = UserApiKeyManager.validateKeyFormat(draftApiKey)
                 if (!formatCheck.isValidFormat) {
                   isLocalActionError = true
                   localActionNotice = formatCheck.feedbackMessage
                   return@GlassButton
                 }
-                draftApiKey.trim()
+                formatCheck.cleanedKey
               } else {
                 apiKeyManager.getDecryptedApiKey()?.takeIf { it.isNotBlank() }
                   ?: GeminiService.getBuiltInPlatformKey()
@@ -687,7 +688,11 @@ fun AiProviderApiKeyPanel(
                   apiKeyManager.recordConnectionSuccess(targetModelId)
                   isLocalActionError = false
                   localActionNotice =
-                    "Connection verified! Live response received from $targetModelId."
+                    if (testingUnsavedDraft) {
+                      "Connection verified for $targetModelId! Tap 'Save API Key' to save this key."
+                    } else {
+                      "Connection verified! Live response received from $targetModelId."
+                    }
                 }
                 .onFailure { err ->
                   apiKeyManager.recordConnectionFailure(err, targetModelId)

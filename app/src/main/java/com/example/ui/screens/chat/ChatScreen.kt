@@ -316,7 +316,9 @@ class AstrynSpeechController(
                     if (activeMessageId == utteranceId) {
                       activeMessageId = null
                       onSpeakingMessageChanged(null)
+                      val cb = utteranceCompletionCallback
                       utteranceCompletionCallback = null
+                      cb?.invoke()
                     }
                   }
                 }
@@ -530,6 +532,17 @@ class AstrynSpeechController(
       speakInternal(message.id, speechText)
     } else {
       pendingUtterance = message.id to speechText
+      val queuedId = message.id
+      mainHandler.postDelayed(
+        {
+          if (!isEngineReady && activeMessageId == queuedId) {
+            pendingUtterance = null
+            activeMessageId = null
+            onSpeakingMessageChanged(null)
+          }
+        },
+        2500L,
+      )
     }
     return true
   }
@@ -677,8 +690,14 @@ class AstrynSpeechController(
           putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
           putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
         }
-      engine.speak(speakable.take(3900), TextToSpeech.QUEUE_FLUSH, params, messageId)
-    } catch (_: Exception) {}
+      val speakRes =
+        engine.speak(speakable.take(3900), TextToSpeech.QUEUE_FLUSH, params, messageId)
+      if (speakRes == TextToSpeech.ERROR) {
+        clearSpeakingAfterFailure(messageId)
+      }
+    } catch (_: Exception) {
+      clearSpeakingAfterFailure(messageId)
+    }
   }
 
   fun stop() {
@@ -1154,10 +1173,14 @@ fun ChatScreen(
     if (isListeningVoice) {
       isListeningVoice = false
       try {
+        // Call stopListening() without immediately destroying so Android can deliver final onResults
         activeSpeechRecognizer?.stopListening()
-        activeSpeechRecognizer?.destroy()
-      } catch (_: Exception) {}
-      activeSpeechRecognizer = null
+      } catch (_: Exception) {
+        try {
+          activeSpeechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        activeSpeechRecognizer = null
+      }
     } else {
       speechController.stop()
       val hasAudioPerm =
@@ -1175,17 +1198,22 @@ fun ChatScreen(
     }
   }
 
-  // Auto-read aloud completed AI responses in JARVIS Hindi voice and auto-listen next turn
+  // Auto-read aloud completed AI responses in Live Voice Mode and surface real errors cleanly
   LaunchedEffect(uiState.isGenerating, uiState.messages.size, isLiveVoiceMode, isNativeLiveAudioPlaying) {
     if (isLiveVoiceMode && !uiState.isGenerating && !isNativeLiveAudioPlaying) {
       val latestAssistant =
         uiState.messages.lastOrNull {
           it.role == MessageRole.MODEL &&
-            it.status == MessageStatus.SUCCESS &&
+            (it.status == MessageStatus.SUCCESS || it.status == MessageStatus.ERROR) &&
             it.content.isNotBlank()
         }
       if (latestAssistant != null && latestAssistant.id != lastAutoSpokenMessageId) {
         lastAutoSpokenMessageId = latestAssistant.id
+        if (latestAssistant.status == MessageStatus.ERROR) {
+          liveVoiceFeedbackMessage =
+            latestAssistant.errorMessage?.takeIf { it.isNotBlank() } ?: latestAssistant.content
+          return@LaunchedEffect
+        }
         // Ensure SpeechRecognizer is stopped while TTS speaks so Android does not mute STREAM_MUSIC
         if (isListeningVoice) {
           isListeningVoice = false

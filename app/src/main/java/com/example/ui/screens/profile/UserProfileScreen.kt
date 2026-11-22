@@ -1362,8 +1362,20 @@ fun UserProfileScreen(
                             statusBannerMessage = msg
                           }
                           .onFailure { err ->
+                            val raw = err.message ?: "Failed to send reset email."
+                            if (
+                              raw.contains("FIREBASE_KEY_MISSING", ignoreCase = true) ||
+                                raw.contains("API key not valid", ignoreCase = true) ||
+                                raw.contains("FIREBASE_WEB_API_KEY", ignoreCase = true)
+                            ) {
+                              showFirebaseKeySetupBox = true
+                            }
                             isStatusError = true
-                            statusBannerMessage = err.message ?: "Failed to send reset email."
+                            statusBannerMessage =
+                              raw
+                                .removePrefix("FIREBASE_KEY_MISSING:")
+                                .removePrefix("SESSION_TOKEN_MISSING:")
+                                .trim()
                           }
                       }
                     },

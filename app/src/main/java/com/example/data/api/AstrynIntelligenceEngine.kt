@@ -2248,8 +2248,30 @@ object AstrynIntelligenceEngine {
         lower.contains("ssc chsl") ||
         lower.contains("pichli research")
 
+    val isIdentityOrDirectGreeting =
+      words.size <= 10 &&
+        attachmentResolution.resolvedAttachments.isEmpty() &&
+        (lower.contains("tumhara naam") ||
+          lower.contains("tumhara nam") ||
+          lower.contains("aapka naam") ||
+          lower.contains("apka naam") ||
+          lower.contains("apna naam") ||
+          lower.contains("tera naam") ||
+          lower.contains("naam kya") ||
+          lower.contains("name kya") ||
+          lower.contains("what is your name") ||
+          lower.contains("what's your name") ||
+          lower.contains("whats your name") ||
+          lower.contains("who are you") ||
+          lower.contains("tum kaun ho") ||
+          lower.contains("aap kaun ho") ||
+          lower.contains("tu kaun hai") ||
+          lower.contains("तुम्हारा नाम") ||
+          lower.contains("आपका नाम"))
+
     val isSimpleFactual =
-      words.size in 2..9 &&
+      !isIdentityOrDirectGreeting &&
+        words.size in 2..9 &&
         !isCurrentInfoResearch &&
         !isCodeDebugging &&
         !isLowBudgetBusiness &&
@@ -2263,7 +2285,8 @@ object AstrynIntelligenceEngine {
           lower.contains("rajdhani kya hai"))
 
     val isEducational =
-      !isSimpleFactual &&
+      !isIdentityOrDirectGreeting &&
+        !isSimpleFactual &&
         (lower.contains("samjhao") ||
           lower.contains("explain") ||
           lower.contains("photosynthesis") ||
@@ -2315,6 +2338,7 @@ object AstrynIntelligenceEngine {
         attachmentResolution.resolvedAttachments.isNotEmpty() ->
           PrimaryIntent.MULTIMODAL_DOCUMENT_OR_IMAGE_ANALYSIS
         isMemoryCommand -> PrimaryIntent.MEMORY_MANAGEMENT_COMMAND
+        isIdentityOrDirectGreeting -> PrimaryIntent.CASUAL_CONVERSATION
         mathResult != null -> PrimaryIntent.MATH_AND_DISCOUNT_CALCULATION
         isLowBudgetBusiness -> PrimaryIntent.LOW_BUDGET_BUSINESS_OR_CAREER
         isOptionFollowup -> PrimaryIntent.OPTION_EXPANSION_FOLLOWUP

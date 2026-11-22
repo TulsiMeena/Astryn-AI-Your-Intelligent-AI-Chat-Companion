@@ -276,7 +276,25 @@ class UserApiKeyManager(
      * Explicitly notes that format validation checks structure only and does not prove live validity.
      */
     fun validateKeyFormat(rawInput: String): ApiKeyFormatValidation {
-      val trimmed = rawInput.trim()
+      val sanitized =
+        rawInput
+          .replace("\u200B", "")
+          .replace("\u200C", "")
+          .replace("\u200D", "")
+          .replace("\uFEFF", "")
+          .replace('\u00A0', ' ')
+          .trim()
+      val trimmed =
+        if (
+          sanitized.length >= 2 &&
+            ((sanitized.startsWith("\"") && sanitized.endsWith("\"")) ||
+              (sanitized.startsWith("'") && sanitized.endsWith("'")) ||
+              (sanitized.startsWith("`") && sanitized.endsWith("`")))
+        ) {
+          sanitized.substring(1, sanitized.length - 1).trim()
+        } else {
+          sanitized
+        }
       if (trimmed.isEmpty()) {
         return ApiKeyFormatValidation(
           isValidFormat = false,
@@ -562,19 +580,22 @@ class UserApiKeyManager(
         when (throwable.statusCode) {
           403 ->
             ApiConnectionStatus.RESTRICTED_ERROR to
-              "HTTP 403 Permission Denied: Your key is restricted or the Generative Language API is disabled for its project.$detailSuffix Check key restrictions in Google AI Studio or replace the key."
+              "HTTP 403 Permission Denied: Your key is restricted or the Gemini / Vertex AI API is disabled for its project.$detailSuffix Check key restrictions in Google AI Studio or Google Cloud Console."
           400 ->
             ApiConnectionStatus.AUTH_ERROR to
-              "HTTP 400 Invalid API Key: Google Gemini rejected this key as invalid.$detailSuffix Verify that you copied the full AIza... or AQ.... key from Google AI Studio."
+              "HTTP 400 Invalid API Key: Google rejected this key as invalid.$detailSuffix Verify that you copied the full AIza… (Google AI Studio) or AQ.… (Vertex AI Express) key."
           else ->
             ApiConnectionStatus.AUTH_ERROR to
-              "HTTP 401 Authentication Failed: The API key was rejected as unauthorized or revoked.$detailSuffix Please replace your key with an active key from Google AI Studio."
+              "HTTP 401 Authentication Failed: The API key was rejected as unauthorized or revoked.$detailSuffix Please replace your key with an active Gemini API key."
         }
       }
 
-      is GeminiException.UnsupportedModel ->
+      is GeminiException.UnsupportedModel -> {
+        val cleanDetail = SafeDiagnosticLogger.redactSecrets(throwable.detail).trim()
+        val detailSuffix = if (cleanDetail.isNotBlank()) " $cleanDetail" else ""
         ApiConnectionStatus.INVALID_REQUEST_ERROR to
-          "HTTP 404 Model Unavailable: The selected model ($modelId) was not found or is not supported for your key. Select Gemini 2.5 Flash and try again."
+          "HTTP 404 Model Unavailable: The selected model ($modelId) was not found or is not enabled for your key.$detailSuffix Select Gemini 2.5 Flash and try again."
+      }
 
       is GeminiException.ValidationError ->
         ApiConnectionStatus.INVALID_REQUEST_ERROR to
@@ -582,7 +603,7 @@ class UserApiKeyManager(
 
       is GeminiException.QuotaExceeded ->
         ApiConnectionStatus.QUOTA_ERROR to
-          "HTTP 429 Quota or Rate Limit Exceeded: Your key is valid, but your Google AI Studio quota or rate limit was reached. Wait a moment or switch to Gemini 2.5 Flash Lite."
+          "HTTP 429 Quota or Rate Limit Exceeded: Your key is valid, but your Gemini quota or rate limit was reached. Wait a moment or switch to Gemini 2.5 Flash Lite."
 
       is GeminiException.TimeoutError ->
         ApiConnectionStatus.NETWORK_ERROR to
@@ -591,7 +612,12 @@ class UserApiKeyManager(
       is GeminiException.OfflineError,
       is GeminiException.NetworkError ->
         ApiConnectionStatus.NETWORK_ERROR to
-          "Network Error: Unable to reach generativelanguage.googleapis.com. Check your device's internet connection and try again."
+          "Network Error: Unable to reach the Google Gemini API endpoint. Check your device's internet connection and try again."
+
+      is GeminiException.EmptyResponse,
+      is GeminiException.MalformedResponse ->
+        ApiConnectionStatus.INVALID_REQUEST_ERROR to
+          "Incomplete Response: The model responded without readable text for $modelId. Try testing again or switch to Gemini 2.5 Flash."
 
       else ->
         ApiConnectionStatus.NETWORK_ERROR to
