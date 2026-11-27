@@ -121,7 +121,7 @@ enum class LiveGirlfriendMood(
       CRITICAL VOICE & PERSONA RULES:
       1. ALWAYS answer the user's actual question, command, or topic directly, accurately, and smartly first. Never ignore a question with a generic greeting.
       2. Speak in natural, warm conversational Hinglish or English matching the user's language using Roman/Latin alphabet so the voice engine never goes silent.
-      3. Keep spoken replies clear, natural, and spoken-friendly (1 to 3 sentences) with commas (,) for natural breathing pauses.
+      3. Keep spoken replies clear, natural, and spoken-friendly (2 to 4 complete spoken sentences—never stop mid-thought) with commas (,) for natural breathing pauses.
       4. NEVER use emojis, markdown symbols (*, #, -), bullet points, or robotic filler in spoken voice mode.
       """.trimIndent(),
   ),
@@ -138,7 +138,7 @@ enum class LiveGirlfriendMood(
       You are Aanya (Zoya), the user's sharp, intelligent, calm, and fast-acting Smart & Pro JARVIS partner speaking in warm conversational Roman Hinglish or English.
       CRITICAL VOICE & PERSONA RULES:
       1. Directly and accurately answer the user's question (coding, math, science, business, study, planning) in clear Roman Hinglish or English. Do NOT use Devanagari script.
-      2. Keep replies crisp, accurate, and spoken-friendly (1 to 3 sentences) without emojis or markdown.
+      2. Keep replies crisp, accurate, and spoken-friendly (2 to 4 complete spoken sentences—never stop mid-thought) without emojis or markdown.
       """.trimIndent(),
   ),
   ROMANTIC(
@@ -154,7 +154,7 @@ enum class LiveGirlfriendMood(
       You are Aanya (Zoya) in Caring & Chill mode—speaking in a soothing, gentle, and helpful female voice in Roman Hinglish or English.
       CRITICAL VOICE & PERSONA RULES:
       1. Answer the user's question calmly, accurately, and warmly in Roman Hinglish or English. Do NOT use Devanagari script.
-      2. Keep replies soothing, helpful, and concise (1 to 3 sentences) with natural pauses and zero emojis or markdown.
+      2. Keep replies soothing, helpful, and complete (2 to 4 natural spoken sentences—never cut off mid-thought) with natural pauses and zero emojis or markdown.
       """.trimIndent(),
   ),
   MASTI(
@@ -170,7 +170,7 @@ enum class LiveGirlfriendMood(
       You are Aanya (Zoya) in Savage & Roast mode—witty, clever, and energetic while answering every question accurately in lively Roman Hinglish or English.
       CRITICAL VOICE & PERSONA RULES:
       1. Always answer the user's question smartly with a touch of witty charm in Roman Hinglish or English. Do NOT use Devanagari script.
-      2. Keep replies punchy, accurate, and short (1 to 3 spoken sentences) with no emojis or markdown.
+      2. Keep replies punchy, accurate, and complete (2 to 4 spoken sentences—never cut off mid-thought) with no emojis or markdown.
       """.trimIndent(),
   );
 
@@ -284,6 +284,9 @@ class GeminiLiveVoiceSession(
   private val audioPlaybackQueue = LinkedBlockingQueue<PcmAudioChunk>(MAX_PLAYBACK_QUEUE_CHUNKS)
   private val isPlaybackLoopRunning = AtomicBoolean(false)
   private val isPlayingNativeAudio = AtomicBoolean(false)
+  private val isServerModelTurnActive = AtomicBoolean(false)
+  private val isPlaybackInterrupted = AtomicBoolean(false)
+  @Volatile private var lastPlaybackEndedAtMs: Long = 0L
   private var audioTrack: AudioTrack? = null
   private var currentAudioTrackSampleRate: Int = PCM_OUTPUT_SAMPLE_RATE
   private var playbackThread: Thread? = null
@@ -323,11 +326,14 @@ class GeminiLiveVoiceSession(
     private const val MAX_RECONNECT_ATTEMPTS = 3
 
     // Adaptive barge-in & VAD silence flush thresholds
-    private const val MIC_VOICE_ACTIVE_RMS_THRESHOLD = 280.0
-    private const val MIC_SILENCE_TURN_END_MS = 1200L
-    private const val BARGE_IN_RMS_THRESHOLD_WITH_AEC = 1900.0
-    private const val BARGE_IN_RMS_THRESHOLD_NO_AEC = 3200.0
-    private const val BARGE_IN_REQUIRED_CONSECUTIVE_FRAMES = 6 // ~180ms at 30ms/chunk
+    private const val MIC_VOICE_ACTIVE_RMS_THRESHOLD = 260.0
+    private const val MIC_SILENCE_TURN_END_MS = 1650L
+    private const val BARGE_IN_RMS_THRESHOLD_WITH_AEC = 2200.0
+    private const val BARGE_IN_RMS_THRESHOLD_NO_AEC = 4200.0
+    private const val BARGE_IN_REQUIRED_CONSECUTIVE_FRAMES = 8 // ~240ms at 30ms/chunk
+    private const val ECHO_TAIL_COOLDOWN_MS = 480L
+    private const val LIVE_POLL_TIMEOUT_ACTIVE_MS = 650L
+    private const val LIVE_POLL_TIMEOUT_IDLE_MS = 180L
 
     /**
      * Allowed safe local function names for Gemini Live `toolCall`.
@@ -1784,6 +1790,7 @@ class GeminiLiveVoiceSession(
 
       // 4a. Server-side Barge-In Interruption (`"interrupted": true`)
       if (serverContent.optBoolean("interrupted", false)) {
+        isServerModelTurnActive.set(false)
         interruptPlayback()
         onInterrupted()
         return
@@ -1806,6 +1813,8 @@ class GeminiLiveVoiceSession(
       if (outputTranscription != null) {
         val outChunk = outputTranscription.optString("text", "")
         if (outChunk.isNotEmpty()) {
+          isServerModelTurnActive.set(true)
+          isPlaybackInterrupted.set(false)
           currentTurnTranscript.append(outChunk)
           val fullTranscript = currentTurnTranscript.toString().trim()
           updateState { it.copy(liveAssistantTranscript = fullTranscript) }
@@ -1817,6 +1826,8 @@ class GeminiLiveVoiceSession(
       val modelTurn = serverContent.optJSONObject("modelTurn")
       val parts = modelTurn?.optJSONArray("parts")
       if (parts != null) {
+        isServerModelTurnActive.set(true)
+        isPlaybackInterrupted.set(false)
         for (i in 0 until parts.length()) {
           val part = parts.optJSONObject(i) ?: continue
           val textDelta = part.optString("text", "")
@@ -1841,14 +1852,15 @@ class GeminiLiveVoiceSession(
 
       // 4e. Turn Complete (`turnComplete: true`)
       if (serverContent.optBoolean("turnComplete", false)) {
+        isServerModelTurnActive.set(false)
         val completed = currentTurnTranscript.toString().trim()
         val hadNativeAudio = receivedNativeAudioInCurrentTurn.getAndSet(false)
         currentTurnTranscript.clear()
         currentUserTranscript.clear()
 
-        if (audioPlaybackQueue.isEmpty()) {
-          isPlayingNativeAudio.set(false)
-          onNativeAudioPlayingChanged(false)
+        // Let the playback thread naturally drain any final in-flight PCM chunk before flipping
+        // isPlayingNativeAudio to false so the ending syllable is never clipped mid-write.
+        if (!hadNativeAudio && audioPlaybackQueue.isEmpty() && !isPlayingNativeAudio.get()) {
           updateState {
             it.copy(
               isPlayingNativeAudio = false,
@@ -2159,14 +2171,17 @@ class GeminiLiveVoiceSession(
               updateState { it.copy(micRmsLevel = normalizedLevel) }
 
               // Step 4: Echo Suppression & Barge-In while AI is speaking (native AudioTrack or fallback TTS)
+              val nowMs = System.currentTimeMillis()
               val isAiCurrentlySpeaking =
                 isPlayingNativeAudio.get() || isExternalTtsSpeaking.get()
-              if (isAiCurrentlySpeaking) {
+              val inEchoTailCooldown =
+                (nowMs - lastPlaybackEndedAtMs) in 0L until ECHO_TAIL_COOLDOWN_MS
+              if (isAiCurrentlySpeaking || inEchoTailCooldown) {
                 val hasHardwareAec = echoCanceler?.enabled == true
                 val threshold =
                   if (hasHardwareAec) BARGE_IN_RMS_THRESHOLD_WITH_AEC
                   else BARGE_IN_RMS_THRESHOLD_NO_AEC
-                if (rms >= threshold) {
+                if (isAiCurrentlySpeaking && rms >= threshold) {
                   consecutiveBargeInFrames++
                   if (consecutiveBargeInFrames >= BARGE_IN_REQUIRED_CONSECUTIVE_FRAMES) {
                     consecutiveBargeInFrames = 0
@@ -2178,7 +2193,7 @@ class GeminiLiveVoiceSession(
                   }
                 } else {
                   consecutiveBargeInFrames = 0
-                  // Suppress mic input while AI is speaking to prevent self-triggering echo loop
+                  // Suppress mic input while AI is speaking or during brief acoustic echo tail
                   continue
                 }
               } else {
@@ -2186,7 +2201,6 @@ class GeminiLiveVoiceSession(
               }
 
               // Track voice activity so sustained post-speech pause flushes audioStreamEnd
-              val nowMs = System.currentTimeMillis()
               if (rms >= MIC_VOICE_ACTIVE_RMS_THRESHOLD) {
                 hadMicSpeechInCurrentBurst.set(true)
                 hasFlushedStreamEndForBurst.set(false)
@@ -2432,6 +2446,8 @@ class GeminiLiveVoiceSession(
     try {
       val pcmBytes = Base64.decode(base64Pcm, Base64.DEFAULT)
       if (pcmBytes.isEmpty()) return
+      isServerModelTurnActive.set(true)
+      isPlaybackInterrupted.set(false)
       receivedNativeAudioInCurrentTurn.set(true)
       ensurePlaybackThreadStarted()
       if (!audioPlaybackQueue.offer(PcmAudioChunk(pcmBytes, sampleRateHz))) {
@@ -2450,22 +2466,40 @@ class GeminiLiveVoiceSession(
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
             while (isPlaybackLoopRunning.get() && !Thread.currentThread().isInterrupted) {
               try {
-                val chunk = audioPlaybackQueue.poll(380, TimeUnit.MILLISECONDS)
+                val pollTimeout =
+                  if (isServerModelTurnActive.get()) LIVE_POLL_TIMEOUT_ACTIVE_MS
+                  else LIVE_POLL_TIMEOUT_IDLE_MS
+                val chunk = audioPlaybackQueue.poll(pollTimeout, TimeUnit.MILLISECONDS)
                 if (chunk == null) {
-                  if (isPlayingNativeAudio.compareAndSet(true, false)) {
-                    onNativeAudioPlayingChanged(false)
-                    updateState {
-                      it.copy(
-                        isPlayingNativeAudio = false,
-                        interactionState =
-                          when {
-                            isMicMuted.get() -> LiveVoiceInteractionState.MUTED
-                            isMicRecording.get() -> LiveVoiceInteractionState.LISTENING
-                            else -> LiveVoiceInteractionState.IDLE
-                          },
-                      )
+                  // Only end native playback once server finished its turn AND queue stayed empty
+                  if (!isServerModelTurnActive.get() && audioPlaybackQueue.isEmpty() && isPlayingNativeAudio.get()) {
+                    try {
+                      Thread.sleep(160L) // allow AudioTrack ring buffer to finish speaking final syllable
+                    } catch (_: InterruptedException) {
+                      break
+                    }
+                    if (!isServerModelTurnActive.get() && audioPlaybackQueue.isEmpty() && !isPlaybackInterrupted.get()) {
+                      lastPlaybackEndedAtMs = System.currentTimeMillis()
+                      if (isPlayingNativeAudio.compareAndSet(true, false)) {
+                        onNativeAudioPlayingChanged(false)
+                        updateState {
+                          it.copy(
+                            isPlayingNativeAudio = false,
+                            interactionState =
+                              when {
+                                isMicMuted.get() -> LiveVoiceInteractionState.MUTED
+                                isMicRecording.get() -> LiveVoiceInteractionState.LISTENING
+                                else -> LiveVoiceInteractionState.IDLE
+                              },
+                          )
+                        }
+                      }
                     }
                   }
+                  continue
+                }
+
+                if (isPlaybackInterrupted.get()) {
                   continue
                 }
 
@@ -2480,11 +2514,12 @@ class GeminiLiveVoiceSession(
                   }
                 }
 
-                // Write in 2048-byte sub-slices so barge-in interruption stops within <40ms
+                // Write in 2048-byte sub-slices so genuine barge-in stops within <40ms,
+                // while turnComplete never aborts an already-dequeued final chunk mid-syllable.
                 var offset = 0
                 val data = chunk.bytes
                 val sliceSize = 2048
-                while (offset < data.size && isPlayingNativeAudio.get() && isPlaybackLoopRunning.get()) {
+                while (offset < data.size && !isPlaybackInterrupted.get() && isPlaybackLoopRunning.get()) {
                   val toWrite = minOf(sliceSize, data.size - offset)
                   val written = track.write(data, offset, toWrite)
                   if (written <= 0) break
@@ -2532,6 +2567,8 @@ class GeminiLiveVoiceSession(
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
           ).coerceAtLeast(4096)
+        // Larger ~500ms ring buffer prevents audio stutter/crackle on packet jitter
+        val streamBufferSize = (minBuf * 4).coerceAtLeast(sampleRateHz)
 
         val newTrack =
           AudioTrack.Builder()
@@ -2548,7 +2585,7 @@ class GeminiLiveVoiceSession(
                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                 .build()
             )
-            .setBufferSizeInBytes(minBuf * 2)
+            .setBufferSizeInBytes(streamBufferSize)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
@@ -2566,6 +2603,9 @@ class GeminiLiveVoiceSession(
    * Immediately flushes the speaker playback queue and halts `AudioTrack` output (Barge-In).
    */
   fun interruptPlayback() {
+    isPlaybackInterrupted.set(true)
+    isServerModelTurnActive.set(false)
+    lastPlaybackEndedAtMs = System.currentTimeMillis()
     audioPlaybackQueue.clear()
     isPlayingNativeAudio.set(false)
     synchronized(sessionLock) {

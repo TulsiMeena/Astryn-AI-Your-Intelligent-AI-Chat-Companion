@@ -815,7 +815,7 @@ class GeminiService(
     if (activeGirlfriendMood != null) {
       generationConfig.put("temperature", 0.92)
       generationConfig.put("topP", 0.95)
-      generationConfig.put("maxOutputTokens", 320)
+      generationConfig.put("maxOutputTokens", 1024)
     } else {
       generationConfig.put("temperature", preferences.responseStyle.temperature)
       generationConfig.put("topP", 0.95)

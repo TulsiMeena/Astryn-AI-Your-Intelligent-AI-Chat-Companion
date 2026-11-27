@@ -85,6 +85,8 @@ import com.example.data.api.LiveConnectionState
 import com.example.data.api.LiveGirlfriendMood
 import com.example.data.api.LiveVoiceInteractionState
 import com.example.service.ZoyaForegroundService
+import com.example.ui.audio.AstrynSoundEffect
+import com.example.ui.audio.AstrynSoundEngine
 import com.example.ui.theme.AppBorder
 import com.example.ui.theme.AppRadius
 import com.example.ui.theme.AppSpacing
@@ -127,6 +129,7 @@ fun LiveGirlfriendVoiceCallScreen(
   externalVoiceFeedback: String? = null,
   onClearExternalVoiceFeedback: () -> Unit = {},
   onUserTranscriptFromWs: (String) -> Unit = {},
+  onMoodSyncedByTool: (LiveGirlfriendMood) -> Unit = onSelectMood,
 ) {
   val context = LocalContext.current
   val reducedMotion = LocalReducedMotion.current
@@ -142,7 +145,7 @@ fun LiveGirlfriendVoiceCallScreen(
   val latestOnStopFallbackTts by rememberUpdatedState(onStopFallbackTts)
   val latestOnSpeakFallbackTts by rememberUpdatedState(onSpeakFallbackTts)
   val latestOnUserTranscriptFromWs by rememberUpdatedState(onUserTranscriptFromWs)
-  val latestOnSelectMood by rememberUpdatedState(onSelectMood)
+  val latestOnMoodSyncedByTool by rememberUpdatedState(onMoodSyncedByTool)
   val latestOnToggleTalkMic by rememberUpdatedState(onToggleTalkMic)
 
   // Real-time Bidirectional Gemini Live WebSocket + AudioRecord/AudioTrack session
@@ -166,7 +169,7 @@ fun LiveGirlfriendVoiceCallScreen(
         latestOnStopFallbackTts()
       },
       onMoodChangedByTool = { toolMood ->
-        latestOnSelectMood(toolMood)
+        latestOnMoodSyncedByTool(toolMood)
       },
       onFallbackToDeviceVoiceRequested = {
         mainHandler.post {
@@ -241,6 +244,7 @@ fun LiveGirlfriendVoiceCallScreen(
     }
 
     if (liveSnap.isMicRecording || isListeningVoice) {
+      AstrynSoundEngine.play(context, AstrynSoundEffect.VOICE_STOP, bypassVoiceBusyGuard = true)
       if (liveSnap.isMicRecording) {
         liveWsSession.stopMicrophoneStreaming()
       }
@@ -254,6 +258,7 @@ fun LiveGirlfriendVoiceCallScreen(
           PackageManager.PERMISSION_GRANTED
       if (hasAudioPerm) {
         permissionFeedbackMessage = null
+        AstrynSoundEngine.play(context, AstrynSoundEffect.VOICE_START, bypassVoiceBusyGuard = true)
         if (liveSnap.isMicMuted) {
           liveWsSession.toggleMicMuted()
         }
@@ -304,6 +309,8 @@ fun LiveGirlfriendVoiceCallScreen(
   }
 
   val handleCleanEndCall: () -> Unit = {
+    AstrynSoundEngine.play(context, AstrynSoundEffect.VOICE_STOP, bypassVoiceBusyGuard = true)
+    AstrynSoundEngine.setVoiceBusy(false)
     liveWsSession.interruptPlayback()
     liveWsSession.disconnect()
     onStopFallbackTts()
@@ -324,6 +331,10 @@ fun LiveGirlfriendVoiceCallScreen(
 
   LaunchedEffect(isWhisperMode) {
     liveWsSession.setWhisperMode(isWhisperMode)
+  }
+
+  LaunchedEffect(isEffectiveListening, isEffectiveSpeaking) {
+    AstrynSoundEngine.setVoiceBusy(isEffectiveListening || isEffectiveSpeaking)
   }
 
   LaunchedEffect(
@@ -354,11 +365,13 @@ fun LiveGirlfriendVoiceCallScreen(
       liveWsSession.toggleMicMuted()
     }
     ZoyaForegroundService.onNotificationEndCall = {
+      AstrynSoundEngine.setVoiceBusy(false)
       liveWsSession.disconnect()
       onStopFallbackTts()
       onEndCall()
     }
     onDispose {
+      AstrynSoundEngine.setVoiceBusy(false)
       ZoyaForegroundService.onNotificationToggleMute = null
       ZoyaForegroundService.onNotificationEndCall = null
       ZoyaForegroundService.stop(context)
@@ -641,6 +654,7 @@ fun LiveGirlfriendVoiceCallScreen(
                     shape = AppRadius.shapePill,
                   )
                   .clickable(role = Role.Button) {
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                     liveWsSession.interruptPlayback()
                     onSelectMood(mood)
                   }
@@ -677,8 +691,12 @@ fun LiveGirlfriendVoiceCallScreen(
                   shape = AppRadius.shapePill,
                 )
                 .clickable(role = Role.Button) {
-                  liveWsSession.interruptPlayback()
                   val nextWhisper = !activeWhisper
+                  AstrynSoundEngine.play(
+                    context,
+                    if (nextWhisper) AstrynSoundEffect.TOGGLE_ON else AstrynSoundEffect.TOGGLE_OFF,
+                  )
+                  liveWsSession.interruptPlayback()
                   liveWsSession.setWhisperMode(nextWhisper)
                   onToggleWhisperMode(nextWhisper)
                 }
@@ -888,6 +906,7 @@ fun LiveGirlfriendVoiceCallScreen(
               .background(Color(0x1400F2FE))
               .border(AppBorder.hairline, Color(0x6600F2FE), RoundedCornerShape(18.dp))
               .clickable(role = Role.Button) {
+                AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                 onReplayLastVoice()
               }
               .padding(horizontal = 16.dp, vertical = 14.dp)
@@ -952,6 +971,7 @@ fun LiveGirlfriendVoiceCallScreen(
                   .background(Color(0x1F00F2FE))
                   .border(AppBorder.hairline, Color(0x6600F2FE), AppRadius.shapePill)
                   .clickable(role = Role.Button) {
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                     liveWsSession.interruptPlayback()
                     onStopFallbackTts()
                     if (!liveWsSession.isLiveWebSocketReady() || !liveWsSession.sendClientTextTurn(promptText)) {
@@ -1003,6 +1023,7 @@ fun LiveGirlfriendVoiceCallScreen(
                   CircleShape,
                 )
                 .clickable(role = Role.Button) {
+                  AstrynSoundEngine.play(context, AstrynSoundEffect.TAP, bypassVoiceBusyGuard = true)
                   liveWsSession.toggleMicMuted()
                   if (isListeningVoice) {
                     onToggleTalkMic()

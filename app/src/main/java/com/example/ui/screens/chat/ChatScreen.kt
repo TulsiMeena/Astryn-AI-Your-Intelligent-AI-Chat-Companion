@@ -9,7 +9,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -160,6 +162,8 @@ import com.example.data.model.MessageRole
 import com.example.data.model.MessageStatus
 import com.example.data.model.WebCitation
 import com.example.data.repository.AiPersona
+import com.example.ui.audio.AstrynSoundEffect
+import com.example.ui.audio.AstrynSoundEngine
 import com.example.ui.components.AmbientGlassBackground
 import com.example.ui.components.AstrynLogoEmblem
 import com.example.ui.components.GlassButton
@@ -207,6 +211,8 @@ class AstrynSpeechController(
   private var pendingGirlfriendUtterance: Triple<String, String, LiveGirlfriendMood>? = null
   private var utteranceCompletionCallback: (() -> Unit)? = null
   private var lastSpokenTextByMessage: Pair<String, String>? = null
+  private var activeFinalChunkId: String? = null
+  private var audioFocusRequest: AudioFocusRequest? = null
   var activeMessageId: String? = null
     private set
   var speechRate: Float = 1.0f
@@ -215,6 +221,7 @@ class AstrynSpeechController(
 
   companion object {
     val SPEED_STEPS = listOf(1.0f, 1.25f, 1.5f, 0.85f)
+    private const val MAX_TTS_CHUNK_CHARS = 220
 
     fun formatRate(rate: Float): String {
       return when {
@@ -225,10 +232,158 @@ class AstrynSpeechController(
         else -> "${rate}x"
       }
     }
+
+    internal fun splitIntoSpeakableChunks(
+      text: String,
+      maxChunkChars: Int = MAX_TTS_CHUNK_CHARS,
+    ): List<String> {
+      val normalized = text.trim().take(4800)
+      if (normalized.isBlank()) return emptyList()
+      if (normalized.length <= maxChunkChars) return listOf(normalized)
+
+      val sentences =
+        normalized
+          .split(Regex("""(?<=[.!?।])\s+|\n+"""))
+          .map { it.trim() }
+          .filter { it.isNotBlank() }
+
+      val chunks = ArrayList<String>()
+      val current = StringBuilder()
+
+      fun flushCurrent() {
+        if (current.isNotEmpty()) {
+          chunks.add(current.toString().trim())
+          current.clear()
+        }
+      }
+
+      fun appendOversizedSegment(segment: String) {
+        val clauses =
+          segment
+            .split(Regex("""(?<=[,;:])\s+"""))
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+        for (clause in clauses) {
+          if (clause.length <= maxChunkChars) {
+            if (current.isEmpty()) {
+              current.append(clause)
+            } else if (current.length + 1 + clause.length <= maxChunkChars) {
+              current.append(' ').append(clause)
+            } else {
+              flushCurrent()
+              current.append(clause)
+            }
+          } else {
+            val words = clause.split(Regex("""\s+""")).filter { it.isNotBlank() }
+            for (word in words) {
+              if (current.isEmpty()) {
+                current.append(word.take(maxChunkChars))
+              } else if (current.length + 1 + word.length <= maxChunkChars) {
+                current.append(' ').append(word)
+              } else {
+                flushCurrent()
+                current.append(word.take(maxChunkChars))
+              }
+            }
+          }
+        }
+      }
+
+      for (sentence in sentences) {
+        if (sentence.length > maxChunkChars) {
+          flushCurrent()
+          appendOversizedSegment(sentence)
+        } else if (current.isEmpty()) {
+          current.append(sentence)
+        } else if (current.length + 1 + sentence.length <= maxChunkChars) {
+          current.append(' ').append(sentence)
+        } else {
+          flushCurrent()
+          current.append(sentence)
+        }
+      }
+      flushCurrent()
+      return chunks.ifEmpty { listOf(normalized.take(maxChunkChars)) }
+    }
   }
 
   init {
     initTtsEngine(preferGoogleEngine = true)
+  }
+
+  private fun requestSpeechAudioFocus() {
+    try {
+      val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (audioFocusRequest == null) {
+          val attrs =
+            AudioAttributes.Builder()
+              .setUsage(AudioAttributes.USAGE_MEDIA)
+              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+              .build()
+          audioFocusRequest =
+            AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+              .setAudioAttributes(attrs)
+              .setAcceptsDelayedFocusGain(false)
+              .build()
+        }
+        audioFocusRequest?.let { audioManager.requestAudioFocus(it) }
+      } else {
+        @Suppress("DEPRECATION")
+        audioManager.requestAudioFocus(
+          null,
+          AudioManager.STREAM_MUSIC,
+          AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK,
+        )
+      }
+    } catch (_: Exception) {}
+  }
+
+  private fun abandonSpeechAudioFocus() {
+    try {
+      val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+      } else {
+        @Suppress("DEPRECATION")
+        audioManager.abandonAudioFocus(null)
+      }
+    } catch (_: Exception) {}
+  }
+
+  private fun extractBaseUtteranceId(utteranceId: String?): String? {
+    if (utteranceId.isNullOrBlank()) return null
+    return utteranceId.substringBefore("__chunk_").removeSuffix("_retry")
+  }
+
+  private fun speakChunkedText(
+    engine: TextToSpeech,
+    baseUtteranceId: String,
+    speakableText: String,
+    params: Bundle,
+  ): Boolean {
+    val chunks = splitIntoSpeakableChunks(speakableText)
+    if (chunks.isEmpty()) return false
+
+    requestSpeechAudioFocus()
+    AstrynSoundEngine.setVoiceBusy(true)
+
+    if (chunks.size == 1) {
+      activeFinalChunkId = baseUtteranceId
+      val res = engine.speak(chunks[0], TextToSpeech.QUEUE_FLUSH, params, baseUtteranceId)
+      return res != TextToSpeech.ERROR
+    }
+
+    activeFinalChunkId = "${baseUtteranceId}__chunk_${chunks.lastIndex}"
+    chunks.forEachIndexed { index, chunk ->
+      val chunkId = "${baseUtteranceId}__chunk_$index"
+      val queueMode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+      val res = engine.speak(chunk, queueMode, params, chunkId)
+      if (index == 0 && res == TextToSpeech.ERROR) {
+        return false
+      }
+    }
+    return true
   }
 
   private fun initTtsEngine(preferGoogleEngine: Boolean) {
@@ -256,40 +411,62 @@ class AstrynSpeechController(
               object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                   mainHandler.post {
-                    activeMessageId = utteranceId
-                    onSpeakingMessageChanged(utteranceId)
+                    val baseId = extractBaseUtteranceId(utteranceId)
+                    if (activeMessageId == null || activeMessageId == baseId) {
+                      activeMessageId = baseId
+                      AstrynSoundEngine.setVoiceBusy(true)
+                      onSpeakingMessageChanged(baseId)
+                    }
                   }
                 }
 
                 override fun onDone(utteranceId: String?) {
+                  val isFinalChunk =
+                    utteranceId != null &&
+                      (utteranceId == activeFinalChunkId ||
+                        (activeFinalChunkId == null && extractBaseUtteranceId(utteranceId) == activeMessageId) ||
+                        utteranceId.endsWith("_retry"))
+                  if (!isFinalChunk) return
+
                   mainHandler.postDelayed(
                     {
-                      if (activeMessageId == utteranceId) {
+                      val baseId = extractBaseUtteranceId(utteranceId)
+                      if (
+                        activeMessageId == baseId &&
+                          (activeFinalChunkId == null ||
+                            utteranceId == activeFinalChunkId ||
+                            utteranceId.endsWith("_retry"))
+                      ) {
+                        activeFinalChunkId = null
                         activeMessageId = null
+                        abandonSpeechAudioFocus()
+                        AstrynSoundEngine.setVoiceBusy(false)
                         onSpeakingMessageChanged(null)
                         val cb = utteranceCompletionCallback
                         utteranceCompletionCallback = null
                         cb?.invoke()
                       }
                     },
-                    320L,
+                    450L,
                   )
                 }
 
                 private fun handleErrorWithFallback(utteranceId: String?) {
                   mainHandler.post {
+                    val baseId = extractBaseUtteranceId(utteranceId)
                     val lastPair = lastSpokenTextByMessage
                     if (
                       utteranceId != null &&
                         !utteranceId.endsWith("_retry") &&
                         lastPair != null &&
-                        lastPair.first == utteranceId
+                        lastPair.first == baseId
                     ) {
                       try {
                         val engine = tts
                         if (engine != null) {
-                          val retryId = "${utteranceId}_retry"
-                          activeMessageId = retryId
+                          val retryId = "${baseId}_retry"
+                          activeMessageId = baseId
+                          activeFinalChunkId = retryId
                           val indianEng = Locale.forLanguageTag("en-IN")
                           val langRes = engine.setLanguage(indianEng)
                           if (
@@ -308,13 +485,19 @@ class AstrynSpeechController(
                               putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
                               putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
                             }
-                          engine.speak(fallbackText, TextToSpeech.QUEUE_FLUSH, params, retryId)
-                          return@post
+                          val retryRes =
+                            engine.speak(fallbackText, TextToSpeech.QUEUE_FLUSH, params, retryId)
+                          if (retryRes != TextToSpeech.ERROR) {
+                            return@post
+                          }
                         }
                       } catch (_: Exception) {}
                     }
-                    if (activeMessageId == utteranceId) {
+                    if (activeMessageId == baseId || activeMessageId == utteranceId) {
+                      activeFinalChunkId = null
                       activeMessageId = null
+                      abandonSpeechAudioFocus()
+                      AstrynSoundEngine.setVoiceBusy(false)
                       onSpeakingMessageChanged(null)
                       val cb = utteranceCompletionCallback
                       utteranceCompletionCallback = null
@@ -348,7 +531,10 @@ class AstrynSpeechController(
             mainHandler.post {
               pendingUtterance = null
               pendingGirlfriendUtterance = null
+              activeFinalChunkId = null
               activeMessageId = null
+              abandonSpeechAudioFocus()
+              AstrynSoundEngine.setVoiceBusy(false)
               onSpeakingMessageChanged(null)
               val cb = utteranceCompletionCallback
               utteranceCompletionCallback = null
@@ -371,7 +557,10 @@ class AstrynSpeechController(
         mainHandler.post {
           pendingUtterance = null
           pendingGirlfriendUtterance = null
+          activeFinalChunkId = null
           activeMessageId = null
+          abandonSpeechAudioFocus()
+          AstrynSoundEngine.setVoiceBusy(false)
           onSpeakingMessageChanged(null)
           val cb = utteranceCompletionCallback
           utteranceCompletionCallback = null
@@ -524,8 +713,10 @@ class AstrynSpeechController(
     if (speechText.isBlank()) return false
 
     utteranceCompletionCallback = null
+    activeFinalChunkId = null
     activeMessageId = message.id
     lastSpokenTextByMessage = message.id to speechText
+    AstrynSoundEngine.setVoiceBusy(true)
     onSpeakingMessageChanged(message.id)
 
     if (isEngineReady) {
@@ -537,7 +728,10 @@ class AstrynSpeechController(
         {
           if (!isEngineReady && activeMessageId == queuedId) {
             pendingUtterance = null
+            activeFinalChunkId = null
             activeMessageId = null
+            abandonSpeechAudioFocus()
+            AstrynSoundEngine.setVoiceBusy(false)
             onSpeakingMessageChanged(null)
           }
         },
@@ -560,9 +754,11 @@ class AstrynSpeechController(
     val cleanSpeech = GeminiLiveVoiceSession.cleanForGirlfriendSpeech(rawText)
     if (cleanSpeech.isBlank()) return false
 
+    activeFinalChunkId = null
     activeMessageId = utteranceId
     lastSpokenTextByMessage = utteranceId to cleanSpeech
     utteranceCompletionCallback = onFinished
+    AstrynSoundEngine.setVoiceBusy(true)
     onSpeakingMessageChanged(utteranceId)
 
     if (isEngineReady) {
@@ -574,7 +770,10 @@ class AstrynSpeechController(
         {
           if (!isEngineReady && activeMessageId == utteranceId) {
             pendingGirlfriendUtterance = null
+            activeFinalChunkId = null
             activeMessageId = null
+            abandonSpeechAudioFocus()
+            AstrynSoundEngine.setVoiceBusy(false)
             onSpeakingMessageChanged(null)
             val cb = utteranceCompletionCallback
             utteranceCompletionCallback = null
@@ -590,7 +789,10 @@ class AstrynSpeechController(
   private fun clearSpeakingAfterFailure(utteranceId: String) {
     mainHandler.post {
       if (activeMessageId == utteranceId) {
+        activeFinalChunkId = null
         activeMessageId = null
+        abandonSpeechAudioFocus()
+        AstrynSoundEngine.setVoiceBusy(false)
         onSpeakingMessageChanged(null)
         val cb = utteranceCompletionCallback
         utteranceCompletionCallback = null
@@ -632,11 +834,9 @@ class AstrynSpeechController(
             .replace("…", ", ")
             .replace("—", ", ")
             .replace(" - ", ", ")
-            .take(3900)
         } else {
           GeminiLiveVoiceSession.toHumanFriendSpokenPhonetics(speechText)
             .ifBlank { GeminiLiveVoiceSession.transliterateDevanagariToHinglish(speechText) }
-            .take(3900)
         }
 
       val params =
@@ -645,19 +845,28 @@ class AstrynSpeechController(
           putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
         }
 
-      val speakRes =
-        engine.speak(speakableText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
-      if (speakRes == TextToSpeech.ERROR) {
+      val spokenOk =
+        speakChunkedText(
+          engine = engine,
+          baseUtteranceId = utteranceId,
+          speakableText = speakableText,
+          params = params,
+        )
+      if (!spokenOk) {
         val fallbackText =
           GeminiLiveVoiceSession.toHumanFriendSpokenPhonetics(speechText)
             .ifBlank { speechText }
-            .take(3900)
         engine.language = Locale.forLanguageTag("en-IN")
         engine.setPitch(targetPitch)
         engine.setSpeechRate(targetRate)
-        val retryRes =
-          engine.speak(fallbackText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
-        if (retryRes == TextToSpeech.ERROR) {
+        val retryOk =
+          speakChunkedText(
+            engine = engine,
+            baseUtteranceId = utteranceId,
+            speakableText = fallbackText,
+            params = params,
+          )
+        if (!retryOk) {
           clearSpeakingAfterFailure(utteranceId)
         }
       }
@@ -668,7 +877,11 @@ class AstrynSpeechController(
 
   private fun speakInternal(messageId: String, speechText: String) {
     try {
-      val engine = tts ?: return
+      val engine = tts
+      if (engine == null) {
+        clearSpeakingAfterFailure(messageId)
+        return
+      }
       ensureMediaStreamAudible()
       val effectiveRate = if (speechRate == 1.0f) 1.02f else speechRate
       val isHindiActive =
@@ -690,9 +903,14 @@ class AstrynSpeechController(
           putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
           putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
         }
-      val speakRes =
-        engine.speak(speakable.take(3900), TextToSpeech.QUEUE_FLUSH, params, messageId)
-      if (speakRes == TextToSpeech.ERROR) {
+      val spokenOk =
+        speakChunkedText(
+          engine = engine,
+          baseUtteranceId = messageId,
+          speakableText = speakable,
+          params = params,
+        )
+      if (!spokenOk) {
         clearSpeakingAfterFailure(messageId)
       }
     } catch (_: Exception) {
@@ -704,7 +922,10 @@ class AstrynSpeechController(
     pendingUtterance = null
     pendingGirlfriendUtterance = null
     utteranceCompletionCallback = null
+    activeFinalChunkId = null
     activeMessageId = null
+    abandonSpeechAudioFocus()
+    AstrynSoundEngine.setVoiceBusy(false)
     onSpeakingMessageChanged(null)
     try {
       tts?.stop()
@@ -849,8 +1070,13 @@ fun ChatScreen(
   var isNativeLiveAudioPlaying by remember { mutableStateOf(false) }
   var speechRate by remember { mutableStateOf(1.0f) }
   var isListeningVoice by remember { mutableStateOf(false) }
+  var isVoiceSessionWanted by remember { mutableStateOf(false) }
+  var hasSpokenInitialGreeting by rememberSaveable { mutableStateOf(false) }
+  var lastNotifiedReceivedMessageId by rememberSaveable { mutableStateOf<String?>(null) }
+  val chatScreenOpenedAt = remember { System.currentTimeMillis() }
   var voicePrefixDraft by remember { mutableStateOf("") }
   var activeSpeechRecognizer by remember { mutableStateOf<SpeechRecognizer?>(null) }
+  val voiceRetryHandler = remember { Handler(Looper.getMainLooper()) }
 
   val speechController =
     remember(context) {
@@ -859,9 +1085,18 @@ fun ChatScreen(
       }
     }
 
+  LaunchedEffect(isListeningVoice, speakingMessageId, isNativeLiveAudioPlaying) {
+    AstrynSoundEngine.setVoiceBusy(
+      isListeningVoice || speakingMessageId != null || isNativeLiveAudioPlaying
+    )
+  }
+
   DisposableEffect(Unit) {
     onDispose {
+      isVoiceSessionWanted = false
+      voiceRetryHandler.removeCallbacksAndMessages(null)
       speechController.shutdown()
+      AstrynSoundEngine.setVoiceBusy(false)
       try {
         activeSpeechRecognizer?.destroy()
       } catch (_: Exception) {}
@@ -965,9 +1200,10 @@ fun ChatScreen(
       }
     }
 
-  lateinit var startSpeechRecognizerWithLocale: (Boolean) -> Unit
-  startSpeechRecognizerWithLocale = { useEnglishFallback ->
+  lateinit var startSpeechRecognizerWithLocale: (Boolean, Boolean) -> Unit
+  startSpeechRecognizerWithLocale = { useEnglishFallback, hasRetriedBusy ->
     liveVoiceFeedbackMessage = null
+    isVoiceSessionWanted = true
     voicePrefixDraft = uiState.inputText
     val langTag = if (useEnglishFallback) "en-IN" else "hi-IN"
     val recognizeIntent =
@@ -981,10 +1217,10 @@ fun ChatScreen(
         putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1600L)
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
         putExtra(
           RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-          1200L,
+          1500L,
         )
         putExtra(RecognizerIntent.EXTRA_PROMPT, "Aanya sun rahi hai… bolo yaar!")
       }
@@ -1028,6 +1264,7 @@ fun ChatScreen(
               val fallbackSpoken = latestPartialSpeech.trim()
               if (!hasDispatchedSpeechTurn && fallbackSpoken.isNotBlank()) {
                 hasDispatchedSpeechTurn = true
+                isVoiceSessionWanted = false
                 if (isLiveVoiceMode) {
                   lastLiveUserSpokenText = fallbackSpoken
                   viewModel.sendMessage(fallbackSpoken, liveVoiceMood = liveGirlfriendMood)
@@ -1039,7 +1276,25 @@ fun ChatScreen(
 
               // Retry once in en-IN if device lacks hi-IN language pack
               if (!useEnglishFallback && (error == 12 || error == 13)) {
-                startSpeechRecognizerWithLocale(true)
+                startSpeechRecognizerWithLocale(true, hasRetriedBusy)
+                return
+              }
+
+              // Retry inline once cleanly on transient RECOGNIZER_BUSY/CLIENT before opening popup dialog
+              if (
+                !hasRetriedBusy &&
+                  isVoiceSessionWanted &&
+                  (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
+                    error == SpeechRecognizer.ERROR_CLIENT)
+              ) {
+                voiceRetryHandler.postDelayed(
+                  {
+                    if (isVoiceSessionWanted) {
+                      startSpeechRecognizerWithLocale(useEnglishFallback, true)
+                    }
+                  },
+                  260L,
+                )
                 return
               }
 
@@ -1055,6 +1310,7 @@ fun ChatScreen(
                 } catch (_: Exception) {}
               }
 
+              isVoiceSessionWanted = false
               val userHint =
                 when (error) {
                   SpeechRecognizer.ERROR_NO_MATCH,
@@ -1073,11 +1329,13 @@ fun ChatScreen(
               if (isLiveVoiceMode) {
                 liveVoiceFeedbackMessage = userHint
               }
+              AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR, bypassVoiceBusyGuard = true)
               viewModel.showActionFeedback(userHint)
             }
 
             override fun onResults(results: Bundle?) {
               isListeningVoice = false
+              isVoiceSessionWanted = false
               val matches =
                 results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
               val best =
@@ -1135,6 +1393,7 @@ fun ChatScreen(
           voiceIntentLauncher.launch(recognizeIntent)
         } catch (_: Exception) {
           isListeningVoice = false
+          isVoiceSessionWanted = false
           val msg = "Voice input is not supported on this device"
           if (isLiveVoiceMode) liveVoiceFeedbackMessage = msg
           viewModel.showActionFeedback(msg)
@@ -1146,6 +1405,7 @@ fun ChatScreen(
         voiceIntentLauncher.launch(recognizeIntent)
       } catch (_: Exception) {
         isListeningVoice = false
+        isVoiceSessionWanted = false
         val msg = "Voice input is not available on this device"
         if (isLiveVoiceMode) liveVoiceFeedbackMessage = msg
         viewModel.showActionFeedback(msg)
@@ -1154,7 +1414,7 @@ fun ChatScreen(
   }
 
   val launchVoiceRecognitionSession: () -> Unit = {
-    startSpeechRecognizerWithLocale(false)
+    startSpeechRecognizerWithLocale(false, false)
   }
 
   val audioPermissionLauncher =
@@ -1162,16 +1422,22 @@ fun ChatScreen(
       contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
       if (granted) {
+        AstrynSoundEngine.play(context, AstrynSoundEffect.VOICE_START, bypassVoiceBusyGuard = true)
         launchVoiceRecognitionSession()
       } else {
         isListeningVoice = false
+        isVoiceSessionWanted = false
+        AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR, bypassVoiceBusyGuard = true)
         viewModel.showActionFeedback("Microphone permission is required for voice input")
       }
     }
 
   val handleToggleVoiceInput: () -> Unit = {
-    if (isListeningVoice) {
+    if (isListeningVoice || isVoiceSessionWanted) {
+      isVoiceSessionWanted = false
       isListeningVoice = false
+      voiceRetryHandler.removeCallbacksAndMessages(null)
+      AstrynSoundEngine.play(context, AstrynSoundEffect.VOICE_STOP, bypassVoiceBusyGuard = true)
       try {
         // Call stopListening() without immediately destroying so Android can deliver final onResults
         activeSpeechRecognizer?.stopListening()
@@ -1187,13 +1453,32 @@ fun ChatScreen(
         ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
           PackageManager.PERMISSION_GRANTED
       if (hasAudioPerm) {
+        AstrynSoundEngine.play(context, AstrynSoundEffect.VOICE_START, bypassVoiceBusyGuard = true)
         launchVoiceRecognitionSession()
       } else {
         try {
           audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         } catch (_: Exception) {
+          AstrynSoundEngine.play(context, AstrynSoundEffect.VOICE_START, bypassVoiceBusyGuard = true)
           launchVoiceRecognitionSession()
         }
+      }
+    }
+  }
+
+  // Play a crisp receive chime when an AI reply finishes in regular chat mode
+  LaunchedEffect(uiState.isGenerating, uiState.messages.size, isLiveVoiceMode) {
+    if (!isLiveVoiceMode && !uiState.isGenerating) {
+      val latestCompleted =
+        uiState.messages.lastOrNull {
+          it.role == MessageRole.MODEL &&
+            it.status == MessageStatus.SUCCESS &&
+            it.content.isNotBlank() &&
+            it.timestamp >= chatScreenOpenedAt
+        }
+      if (latestCompleted != null && latestCompleted.id != lastNotifiedReceivedMessageId) {
+        lastNotifiedReceivedMessageId = latestCompleted.id
+        AstrynSoundEngine.play(context, AstrynSoundEffect.MESSAGE_RECEIVE)
       }
     }
   }
@@ -1217,6 +1502,7 @@ fun ChatScreen(
         // Ensure SpeechRecognizer is stopped while TTS speaks so Android does not mute STREAM_MUSIC
         if (isListeningVoice) {
           isListeningVoice = false
+          isVoiceSessionWanted = false
           try {
             activeSpeechRecognizer?.stopListening()
             activeSpeechRecognizer?.destroy()
@@ -1237,34 +1523,40 @@ fun ChatScreen(
     }
   }
 
-  // Greet the user with "Welcome boss! How can I help you?" when Live Voice Mode opens
+  // Greet the user with "Welcome boss! How can I help you?" once per Live Voice session
   LaunchedEffect(isLiveVoiceMode) {
     if (isLiveVoiceMode) {
-      liveSessionOpenedAt = System.currentTimeMillis()
-      lastLiveUserSpokenText = ""
-      liveVoiceFeedbackMessage = null
-      if (isListeningVoice) {
-        isListeningVoice = false
-        try {
-          activeSpeechRecognizer?.stopListening()
-          activeSpeechRecognizer?.destroy()
-        } catch (_: Exception) {}
-        activeSpeechRecognizer = null
+      if (!hasSpokenInitialGreeting) {
+        hasSpokenInitialGreeting = true
+        liveSessionOpenedAt = System.currentTimeMillis()
+        lastLiveUserSpokenText = ""
+        liveVoiceFeedbackMessage = null
+        if (isListeningVoice) {
+          isListeningVoice = false
+          isVoiceSessionWanted = false
+          try {
+            activeSpeechRecognizer?.stopListening()
+            activeSpeechRecognizer?.destroy()
+          } catch (_: Exception) {}
+          activeSpeechRecognizer = null
+        }
+        lastAutoSpokenMessageId =
+          uiState.messages
+            .lastOrNull { it.role == MessageRole.MODEL && it.status == MessageStatus.SUCCESS }
+            ?.id
+        speechController.speakAsGirlfriend(
+          utteranceId = "live_jarvis_greeting_${System.currentTimeMillis()}",
+          rawText = LiveGirlfriendMood.DEFAULT_OPENING_GREETING,
+          mood = liveGirlfriendMood,
+          onFinished = {
+            if (isLiveVoiceMode && liveAutoHandsFree && !isListeningVoice && !uiState.isGenerating) {
+              liveAutoListenTrigger++
+            }
+          },
+        )
       }
-      lastAutoSpokenMessageId =
-        uiState.messages
-          .lastOrNull { it.role == MessageRole.MODEL && it.status == MessageStatus.SUCCESS }
-          ?.id
-      speechController.speakAsGirlfriend(
-        utteranceId = "live_jarvis_greeting_${System.currentTimeMillis()}",
-        rawText = LiveGirlfriendMood.DEFAULT_OPENING_GREETING,
-        mood = liveGirlfriendMood,
-        onFinished = {
-          if (isLiveVoiceMode && liveAutoHandsFree && !isListeningVoice && !uiState.isGenerating) {
-            liveAutoListenTrigger++
-          }
-        },
-      )
+    } else {
+      hasSpokenInitialGreeting = false
     }
   }
 
@@ -1336,8 +1628,10 @@ fun ChatScreen(
     triggerLightHaptic()
     val ok = copyTextToSystemClipboard(context, label, text)
     if (ok) {
+      AstrynSoundEngine.play(context, AstrynSoundEffect.SUCCESS)
       viewModel.showActionFeedback("$label copied to clipboard")
     } else {
+      AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
       viewModel.showActionFeedback("Unable to access clipboard")
     }
   }
@@ -1431,8 +1725,12 @@ fun ChatScreen(
           bookmarkCount = bookmarkedMessages.size,
           isSearchActive = showInConvSearch,
           isLiveVoiceMode = isLiveVoiceMode,
-          onOpenPersonaSelector = { showPersonaDialog = true },
+          onOpenPersonaSelector = {
+            AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+            showPersonaDialog = true
+          },
           onToggleInConvSearch = {
+            AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
             showInConvSearch = !showInConvSearch
             if (!showInConvSearch) {
               inConvSearchQuery = ""
@@ -1442,11 +1740,17 @@ fun ChatScreen(
           onToggleLiveVoiceMode = {
             val next = !isLiveVoiceMode
             isLiveVoiceMode = next
-            if (!next) {
+            if (next) {
+              AstrynSoundEngine.play(context, AstrynSoundEffect.VOICE_START, bypassVoiceBusyGuard = true)
+            } else {
+              AstrynSoundEngine.play(context, AstrynSoundEffect.VOICE_STOP, bypassVoiceBusyGuard = true)
               speechController.stop()
             }
           },
-          onOpenBookmarks = { showBookmarksDialog = true },
+          onOpenBookmarks = {
+            AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+            showBookmarksDialog = true
+          },
           onBack = onBack,
           onOpenMenu = onOpenMenu,
         )
@@ -1887,10 +2191,12 @@ fun ChatScreen(
                   },
                   onToggleLike = {
                     triggerLightHaptic()
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.SUCCESS)
                     viewModel.toggleMessageLike(message.id)
                   },
                   onToggleBookmark = {
                     triggerLightHaptic()
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.SUCCESS)
                     viewModel.toggleMessageBookmark(message.id)
                   },
                   onToggleSpeak = {
@@ -2059,6 +2365,7 @@ fun ChatScreen(
           onToggleVoiceInput = handleToggleVoiceInput,
           onSendMessage = {
             triggerLightHaptic()
+            AstrynSoundEngine.play(context, AstrynSoundEffect.MESSAGE_SEND)
             if (isListeningVoice) {
               handleToggleVoiceInput()
             }
@@ -2080,6 +2387,7 @@ fun ChatScreen(
           },
           onStopGeneration = {
             triggerLightHaptic()
+            AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
             viewModel.stopGeneration()
           },
         )
@@ -2140,6 +2448,9 @@ fun ChatScreen(
               mood = newMood,
             )
           }
+        },
+        onMoodSyncedByTool = { toolMood ->
+          liveGirlfriendMood = toolMood
         },
         onToggleTalkMic = handleToggleVoiceInput,
         onToggleAutoHandsFree = { liveAutoHandsFree = !liveAutoHandsFree },
@@ -2243,6 +2554,7 @@ fun ChatScreen(
             variant = GlassButtonVariant.PRIMARY,
             enabled = editDraftText.trim().isNotEmpty() && !uiState.isGenerating,
             onClick = {
+              AstrynSoundEngine.play(context, AstrynSoundEffect.MESSAGE_SEND)
               val submitted =
                 viewModel.editAndResendUserMessage(
                   userMessageId = targetMsg.id,
@@ -3033,6 +3345,7 @@ private fun ChatEmptyConversationState(
   onSelectQuickPrompt: (String) -> Unit,
 ) {
   val glass = AppThemeTokens.glass
+  val context = LocalContext.current
   val quickPrompts =
     remember {
       listOf(
@@ -3151,7 +3464,10 @@ private fun ChatEmptyConversationState(
                   ),
                 shape = AppRadius.shapePill,
               )
-              .clickable { onSelectQuickPrompt(promptText) }
+              .clickable {
+                AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+                onSelectQuickPrompt(promptText)
+              }
               .padding(horizontal = AppSpacing.md, vertical = 10.dp)
               .testTag("chat_empty_suggestion_$idx"),
           verticalAlignment = Alignment.CenterVertically,
@@ -3201,6 +3517,7 @@ private fun ChatComposerBar(
   onStopGeneration: () -> Unit,
 ) {
   val glass = AppThemeTokens.glass
+  val context = LocalContext.current
   val canSend =
     (inputText.isNotBlank() || pendingAttachments.isNotEmpty()) &&
       !isGenerating &&
@@ -3318,6 +3635,7 @@ private fun ChatComposerBar(
                 enabled = !isProcessingAttachment,
                 role = Role.Button,
                 onClick = {
+                  AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                   showPlusToolsMenu = false
                   onPickAttachments()
                 },
@@ -3355,6 +3673,7 @@ private fun ChatComposerBar(
                 enabled = !isProcessingAttachment,
                 role = Role.Button,
                 onClick = {
+                  AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                   showPlusToolsMenu = false
                   onCaptureCameraPhoto()
                 },
@@ -3391,6 +3710,7 @@ private fun ChatComposerBar(
               .clickable(
                 role = Role.Button,
                 onClick = {
+                  AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                   showPlusToolsMenu = false
                   onOpenPromptTemplates()
                 },
@@ -3428,6 +3748,7 @@ private fun ChatComposerBar(
                 .clickable(
                   role = Role.Button,
                   onClick = {
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                     showPlusToolsMenu = false
                     onOpenQuiz()
                   },
@@ -3483,7 +3804,10 @@ private fun ChatComposerBar(
             .clickable(
               enabled = !isProcessingAttachment,
               role = Role.Button,
-              onClick = { showPlusToolsMenu = !showPlusToolsMenu },
+              onClick = {
+                AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+                showPlusToolsMenu = !showPlusToolsMenu
+              },
             )
             .semantics {
               role = Role.Button
@@ -3839,6 +4163,7 @@ private fun ChatMessageItem(
   modifier: Modifier = Modifier,
 ) {
   val glass = AppThemeTokens.glass
+  val context = LocalContext.current
   val uriHandler = LocalUriHandler.current
   val isUser = message.role == MessageRole.USER
   var copiedRecently by remember { mutableStateOf(false) }
@@ -4710,6 +5035,7 @@ private fun ChatMessageItem(
                           contentDescription = "Switch tone: $label"
                         }
                         .clickable(enabled = !isGenerating) {
+                          AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                           onModifyResponse(modeKey)
                         }
                         .padding(horizontal = 9.dp, vertical = 3.dp)
@@ -4756,6 +5082,7 @@ private fun ChatMessageItem(
                             contentDescription = "Ask follow-up: $suggestion"
                           }
                           .clickable(enabled = !isGenerating) {
+                            AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                             onSelectFollowUp(suggestion)
                           }
                           .padding(horizontal = 10.dp, vertical = 3.dp)
@@ -4983,6 +5310,7 @@ private fun MessageMinimalIconAction(
   enabled: Boolean = true,
   isHighlighted: Boolean = false,
 ) {
+  val context = LocalContext.current
   val glass = AppThemeTokens.glass
   val tint =
     when {
@@ -5003,7 +5331,10 @@ private fun MessageMinimalIconAction(
           role = Role.Button
           this.contentDescription = contentDescription
         }
-        .clickable(enabled = enabled, onClick = onClick)
+        .clickable(enabled = enabled) {
+          AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+          onClick()
+        }
         .testTag(testTag),
     contentAlignment = Alignment.Center,
   ) {
@@ -5026,6 +5357,7 @@ private fun MessageActionChip(
   enabled: Boolean = true,
   isHighlighted: Boolean = false,
 ) {
+  val context = LocalContext.current
   val glass = AppThemeTokens.glass
   val tint =
     when {
@@ -5051,7 +5383,10 @@ private fun MessageActionChip(
           role = Role.Button
           this.contentDescription = contentDescription
         }
-        .clickable(enabled = enabled, onClick = onClick)
+        .clickable(enabled = enabled) {
+          AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+          onClick()
+        }
         .padding(horizontal = 6.dp, vertical = 2.dp)
         .testTag(testTag),
     verticalAlignment = Alignment.CenterVertically,

@@ -98,6 +98,7 @@ class MainActivity : ComponentActivity() {
     val preferencesRepository = UserPreferencesRepository.getInstance(applicationContext)
     val apiKeyManager = UserApiKeyManager.getInstance(applicationContext)
     NetworkConnectivityMonitor.getInstance(applicationContext)
+    com.example.ui.audio.AstrynSoundEngine.preload(applicationContext)
 
     setContent {
       val userPreferences by preferencesRepository.preferencesFlow.collectAsState()

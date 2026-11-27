@@ -471,6 +471,7 @@ data class UserPreferences(
   val customPromptTemplates: List<PromptTemplate> = emptyList(),
   val chatBgStyle: ChatBackgroundStyle = ChatBackgroundStyle.LIQUID_AURORA,
   val moodReactiveBg: Boolean = true,
+  val uiSoundsEnabled: Boolean = true,
   val isLoggedIn: Boolean = false,
   val hasSkippedAuth: Boolean = false,
   val userUid: String = "",
@@ -543,6 +544,7 @@ class UserPreferencesRepository(
     private const val KEY_CUSTOM_TEMPLATES = "pref_custom_prompt_templates"
     private const val KEY_CHAT_BG_STYLE = "pref_chat_bg_style"
     private const val KEY_MOOD_REACTIVE_BG = "pref_mood_reactive_bg"
+    private const val KEY_UI_SOUNDS_ENABLED = "pref_ui_sounds_enabled"
     private const val KEY_IS_LOGGED_IN = "pref_auth_is_logged_in"
     private const val KEY_HAS_SKIPPED_AUTH = "pref_auth_has_skipped"
     private const val KEY_USER_UID = "pref_auth_user_uid"
@@ -705,6 +707,10 @@ class UserPreferencesRepository(
 
   fun setMoodReactiveBg(enabled: Boolean) {
     updateAndPersist { it.copy(moodReactiveBg = enabled) }
+  }
+
+  fun setUiSoundsEnabled(enabled: Boolean) {
+    updateAndPersist { it.copy(uiSoundsEnabled = enabled) }
   }
 
   fun getCanonicalUidForEmail(email: String): String? {
@@ -1070,6 +1076,7 @@ class UserPreferencesRepository(
       val rawCustomTemplates = try { prefs.getString(KEY_CUSTOM_TEMPLATES, null) } catch (_: Exception) { null }
       val rawChatBgStyle = try { prefs.getString(KEY_CHAT_BG_STYLE, null) } catch (_: Exception) { null }
       val moodReactiveBg = try { prefs.getBoolean(KEY_MOOD_REACTIVE_BG, true) } catch (_: Exception) { true }
+      val uiSoundsEnabled = try { prefs.getBoolean(KEY_UI_SOUNDS_ENABLED, true) } catch (_: Exception) { true }
       val isLoggedIn = try { prefs.getBoolean(KEY_IS_LOGGED_IN, false) } catch (_: Exception) { false }
       val hasSkippedAuth = try { prefs.getBoolean(KEY_HAS_SKIPPED_AUTH, false) } catch (_: Exception) { false }
       val rawUid = try { prefs.getString(KEY_USER_UID, "") ?: "" } catch (_: Exception) { "" }
@@ -1127,6 +1134,7 @@ class UserPreferencesRepository(
         customPromptTemplates = PromptTemplate.deserializeCustomList(rawCustomTemplates),
         chatBgStyle = ChatBackgroundStyle.fromNameSafe(rawChatBgStyle),
         moodReactiveBg = moodReactiveBg,
+        uiSoundsEnabled = uiSoundsEnabled,
         isLoggedIn = isLoggedIn && resolvedUid.isNotBlank(),
         hasSkippedAuth = hasSkippedAuth,
         userUid = resolvedUid,
@@ -1168,6 +1176,7 @@ class UserPreferencesRepository(
         )
         .putString(KEY_CHAT_BG_STYLE, preferences.chatBgStyle.name)
         .putBoolean(KEY_MOOD_REACTIVE_BG, preferences.moodReactiveBg)
+        .putBoolean(KEY_UI_SOUNDS_ENABLED, preferences.uiSoundsEnabled)
         .putBoolean(KEY_IS_LOGGED_IN, preferences.isLoggedIn)
         .putBoolean(KEY_HAS_SKIPPED_AUTH, preferences.hasSkippedAuth)
         .putString(KEY_USER_UID, preferences.userUid)

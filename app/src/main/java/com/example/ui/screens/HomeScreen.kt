@@ -52,6 +52,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -60,6 +61,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.ui.audio.AstrynSoundEffect
+import com.example.ui.audio.AstrynSoundEngine
 import com.example.ui.components.AiOrb
 import com.example.ui.components.AiOrbState
 import com.example.ui.components.AmbientGlassBackground
@@ -108,6 +111,7 @@ fun HomeScreen(
   modifier: Modifier = Modifier,
   onOpenAuth: () -> Unit = {},
 ) {
+  val context = LocalContext.current
   val glass = AppThemeTokens.glass
   val preferences by UserPreferencesRepository.getInstance().preferencesFlow.collectAsState()
   var quickPromptText by rememberSaveable { mutableStateOf("") }
@@ -231,7 +235,10 @@ fun HomeScreen(
                       color = if (preferences.isLoggedIn) glass.accentCyan else glass.borderAccent,
                       shape = AppRadius.shapePill,
                     )
-                    .clickable(onClick = onOpenAuth)
+                    .clickable {
+                      AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+                      onOpenAuth()
+                    }
                     .padding(horizontal = 8.dp, vertical = 5.dp)
                     .testTag("home_auth_button"),
                 verticalAlignment = Alignment.CenterVertically,
@@ -294,6 +301,7 @@ fun HomeScreen(
               size = 200.dp,
               state = AiOrbState.IDLE,
               onClick = {
+                AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                 onStartNewChat(null)
               },
               modifier = Modifier.testTag("home_ai_orb"),

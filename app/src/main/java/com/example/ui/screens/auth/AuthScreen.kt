@@ -107,6 +107,8 @@ import com.example.R
 import com.example.data.api.EmailSecurityValidator
 import com.example.data.api.FirebaseRestAuthClient
 import com.example.data.repository.UserPreferencesRepository
+import com.example.ui.audio.AstrynSoundEffect
+import com.example.ui.audio.AstrynSoundEngine
 import com.example.ui.components.AmbientGlassBackground
 import com.example.ui.components.GlassButton
 import com.example.ui.components.GlassButtonVariant
@@ -170,29 +172,9 @@ fun AuthScreen(
   var isResendingVerification by remember { mutableStateOf(false) }
   var resendCooldownSeconds by rememberSaveable { mutableIntStateOf(0) }
 
-  // Firebase Web API Key Configuration State
-  var isFirebaseKeyConfigured by remember(preferences.firebaseWebApiKey) {
-    mutableStateOf(FirebaseRestAuthClient.isCloudKeyConfigured())
-  }
-  var showFirebaseKeySetupBox by rememberSaveable {
-    mutableStateOf(!FirebaseRestAuthClient.isCloudKeyConfigured())
-  }
-  var firebaseConfigSnippetInput by rememberSaveable {
-    mutableStateOf(preferences.firebaseWebApiKey)
-  }
-
-  // Try auto-discovering the Firebase Web API key on launch
+  // Silently warm up Firebase Web API key auto-discovery if not already provided via BuildConfig
   LaunchedEffect(Unit) {
-    val discovered = FirebaseRestAuthClient.resolveConfiguredApiKeyWithAutoDiscovery()
-    if (!discovered.isNullOrBlank()) {
-      isFirebaseKeyConfigured = true
-      showFirebaseKeySetupBox = false
-    } else {
-      isFirebaseKeyConfigured = FirebaseRestAuthClient.isCloudKeyConfigured()
-      if (!isFirebaseKeyConfigured) {
-        showFirebaseKeySetupBox = true
-      }
-    }
+    FirebaseRestAuthClient.resolveConfiguredApiKeyWithAutoDiscovery()
   }
 
   // Brute-Force Rate Limiter State
@@ -233,6 +215,7 @@ fun AuthScreen(
             )
           val verifiedResult = pollRes.getOrNull()
           if (verifiedResult != null && verifiedResult.isVerified) {
+            AstrynSoundEngine.play(context, AstrynSoundEffect.SUCCESS)
             preferencesRepository.signInUser(
               uid = pendingVerificationUid,
               idToken = verifiedResult.refreshedIdToken,
@@ -289,20 +272,6 @@ fun AuthScreen(
       }
     }
 
-  fun saveInlineFirebaseKeyIfNeeded(): Boolean {
-    val candidate = firebaseConfigSnippetInput.trim()
-    if (candidate.isNotBlank()) {
-      val extracted = FirebaseRestAuthClient.extractApiKeyFromSnippet(candidate)
-      if (extracted != null) {
-        preferencesRepository.updateFirebaseWebApiKey(extracted)
-        isFirebaseKeyConfigured = true
-        showFirebaseKeySetupBox = false
-        return true
-      }
-    }
-    return FirebaseRestAuthClient.isCloudKeyConfigured()
-  }
-
   fun handlePrimarySubmit() {
     if (isSubmitting || lockoutSecondsRemaining > 0) return
     focusManager.clearFocus()
@@ -313,12 +282,14 @@ fun AuthScreen(
     val trimmedEmail = email.trim().lowercase()
 
     if (isSignUpMode && trimmedName.length < 2) {
+      AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
       errorMessage = "Please enter your full name."
       return
     }
 
     val emailValidation = EmailSecurityValidator.validateEmail(trimmedEmail)
     if (!emailValidation.isValidRealEmail) {
+      AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
       errorMessage = emailValidation.statusMessage
       return
     }
@@ -330,20 +301,14 @@ fun AuthScreen(
         isSignUp = isSignUpMode,
       )
     if (passwordValidationError != null) {
+      AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
       errorMessage = passwordValidationError
       return
     }
 
     if (isSignUpMode && password != confirmPassword) {
+      AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
       errorMessage = "Passwords do not match."
-      return
-    }
-
-    // Save inline Firebase Web API key if the user pasted it in the setup field
-    if (!saveInlineFirebaseKeyIfNeeded() && firebaseConfigSnippetInput.isNotBlank()) {
-      errorMessage =
-        "Invalid Firebase Web API Key format. Paste a valid 'AIzaSy...' key from Firebase Console → Project Settings."
-      showFirebaseKeySetupBox = true
       return
     }
 
@@ -370,6 +335,7 @@ fun AuthScreen(
         .onSuccess { session ->
           failedAttemptsCount = 0
           isSubmitting = false
+          AstrynSoundEngine.play(context, AstrynSoundEffect.SUCCESS)
 
           if (!session.isEmailVerified) {
             pendingVerificationUid = session.uid
@@ -393,12 +359,12 @@ fun AuthScreen(
         }
         .onFailure { throwable ->
           isSubmitting = false
+          AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
           val msg = throwable.message ?: "Authentication failed. Please try again."
           if (
             msg.contains("FIREBASE_KEY_MISSING", ignoreCase = true) ||
               msg.contains("API key not valid", ignoreCase = true)
           ) {
-            showFirebaseKeySetupBox = true
             errorMessage =
               msg.removePrefix("FIREBASE_KEY_MISSING:").trim()
           } else {
@@ -423,6 +389,7 @@ fun AuthScreen(
     val normalizedEmail = FirebaseRestAuthClient.normalizeGoogleEmailInput(targetEmail)
     val check = EmailSecurityValidator.validateEmail(normalizedEmail)
     if (!check.isValidRealEmail) {
+      AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
       googleDialogError = check.statusMessage
       return
     }
@@ -448,6 +415,7 @@ fun AuthScreen(
 
       result
         .onSuccess { session ->
+          AstrynSoundEngine.play(context, AstrynSoundEffect.SUCCESS)
           preferencesRepository.signInUser(
             uid = session.uid,
             idToken = session.idToken,
@@ -462,6 +430,7 @@ fun AuthScreen(
         }
         .onFailure { throwable ->
           isSubmitting = false
+          AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
           errorMessage = throwable.message ?: "Google Sign-In failed."
         }
     }
@@ -572,66 +541,42 @@ fun AuthScreen(
           horizontalAlignment = Alignment.CenterHorizontally,
           verticalArrangement = Arrangement.spacedBy(AppSpacing.md),
         ) {
-          // Top Bar: Small Privacy Policy & Rules Icon (Left/Right) + Firebase Key Status Pill
+          // Top Bar: Privacy Policy & Rules Icon Button
           Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.Start,
             verticalAlignment = Alignment.CenterVertically,
           ) {
-            // Small Corner Privacy Policy & Rules Icon Button
             Box(
               modifier =
-                Modifier.size(38.dp)
+                Modifier.size(48.dp)
                   .clip(CircleShape)
-                  .background(glass.surfaceStandard)
-                  .border(
-                    width = AppBorder.hairline,
-                    color = glass.accentCyan.copy(alpha = 0.55f),
-                    shape = CircleShape,
-                  )
-                  .clickable { showPrivacyRulesDialog = true }
+                  .clickable {
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+                    showPrivacyRulesDialog = true
+                  }
                   .testTag("auth_privacy_policy_icon_button"),
               contentAlignment = Alignment.Center,
             ) {
-              Icon(
-                imageVector = Icons.Outlined.Policy,
-                contentDescription = "Privacy Policy & Rules",
-                tint = glass.accentCyan,
-                modifier = Modifier.size(19.dp),
-              )
-            }
-
-            Row(
-              modifier =
-                Modifier.clip(AppRadius.shapePill)
-                  .background(glass.surfaceStandard)
-                  .border(
-                    width = AppBorder.hairline,
-                    color =
-                      if (isFirebaseKeyConfigured) glass.statusSuccess.copy(alpha = 0.45f)
-                      else glass.accentCyan.copy(alpha = 0.55f),
-                    shape = AppRadius.shapePill,
-                  )
-                  .clickable { showFirebaseKeySetupBox = !showFirebaseKeySetupBox }
-                  .padding(horizontal = 10.dp, vertical = 6.dp)
-                  .testTag("auth_firebase_key_toggle"),
-              verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-              Icon(
-                imageVector =
-                  if (isFirebaseKeyConfigured) Icons.Outlined.CheckCircle
-                  else Icons.Outlined.Key,
-                contentDescription = "Firebase Connection",
-                tint = if (isFirebaseKeyConfigured) glass.statusSuccess else glass.accentCyan,
-                modifier = Modifier.size(14.dp),
-              )
-              Text(
-                text = if (isFirebaseKeyConfigured) "Firebase Connected" else "Connect Firebase Key",
-                style = MaterialTheme.typography.labelSmall,
-                color = if (isFirebaseKeyConfigured) glass.statusSuccess else glass.accentCyan,
-                fontWeight = FontWeight.SemiBold,
-              )
+              Box(
+                modifier =
+                  Modifier.size(38.dp)
+                    .clip(CircleShape)
+                    .background(glass.surfaceStandard)
+                    .border(
+                      width = AppBorder.hairline,
+                      color = glass.accentCyan.copy(alpha = 0.55f),
+                      shape = CircleShape,
+                    ),
+                contentAlignment = Alignment.Center,
+              ) {
+                Icon(
+                  imageVector = Icons.Outlined.Policy,
+                  contentDescription = "Privacy Policy & Rules",
+                  tint = glass.accentCyan,
+                  modifier = Modifier.size(19.dp),
+                )
+              }
             }
           }
 
@@ -694,94 +639,6 @@ fun AuthScreen(
               color = glass.textSecondary,
               textAlign = TextAlign.Center,
             )
-          }
-
-          // Collapsible Firebase Web API Key Input (Auto-shown if key is missing)
-          AnimatedVisibility(
-            visible = showFirebaseKeySetupBox,
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically(),
-          ) {
-            GlassSurface(
-              elevated = false,
-              modifier = Modifier.fillMaxWidth().testTag("auth_firebase_key_card"),
-            ) {
-              Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-              ) {
-                Row(
-                  modifier = Modifier.fillMaxWidth(),
-                  horizontalArrangement = Arrangement.SpaceBetween,
-                  verticalAlignment = Alignment.CenterVertically,
-                ) {
-                  Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                  ) {
-                    Icon(
-                      imageVector = Icons.Outlined.Key,
-                      contentDescription = null,
-                      tint = glass.accentCyan,
-                      modifier = Modifier.size(16.dp),
-                    )
-                    Text(
-                      text = "Firebase Web API Key (${FirebaseRestAuthClient.PROJECT_ID})",
-                      style = MaterialTheme.typography.labelMedium,
-                      fontWeight = FontWeight.Bold,
-                      color = glass.textPrimary,
-                    )
-                  }
-                  if (isFirebaseKeyConfigured) {
-                    Text(
-                      text = "Hide",
-                      style = MaterialTheme.typography.labelSmall,
-                      color = glass.textSecondary,
-                      modifier = Modifier.clickable { showFirebaseKeySetupBox = false },
-                    )
-                  }
-                }
-
-                Text(
-                  text =
-                    "Firebase Console → Project Settings → General → Web API Key ('AIzaSy...') yahan paste karein taaki Firebase Authentication aur Email Verification link kaam kare:",
-                  style = MaterialTheme.typography.bodySmall,
-                  color = glass.textSecondary,
-                )
-
-                GlassTextField(
-                  value = firebaseConfigSnippetInput,
-                  onValueChange = {
-                    firebaseConfigSnippetInput = it
-                    errorMessage = null
-                  },
-                  placeholder = "Paste AIzaSy... Web API Key or firebaseConfig",
-                  singleLine = true,
-                  modifier = Modifier.fillMaxWidth().testTag("auth_firebase_apikey_input"),
-                )
-
-                GlassButton(
-                  text = "Save Firebase Key",
-                  variant = GlassButtonVariant.PRIMARY,
-                  onClick = {
-                    val extracted =
-                      FirebaseRestAuthClient.extractApiKeyFromSnippet(firebaseConfigSnippetInput)
-                    if (extracted == null) {
-                      errorMessage =
-                        "Valid Firebase Web API Key ('AIzaSy...') nahi mila. Kripya Firebase Project Settings se Web API Key paste karein."
-                    } else {
-                      preferencesRepository.updateFirebaseWebApiKey(extracted)
-                      isFirebaseKeyConfigured = true
-                      showFirebaseKeySetupBox = false
-                      errorMessage = null
-                      successBannerMessage =
-                        "Firebase Web API Key connected (${FirebaseRestAuthClient.PROJECT_ID}) ✓"
-                    }
-                  },
-                  modifier = Modifier.fillMaxWidth().testTag("auth_save_firebase_key_button"),
-                )
-              }
-            }
           }
 
           // =================================================================
@@ -877,7 +734,7 @@ fun AuthScreen(
 
                 Text(
                   text =
-                    "Astryn AI sent a verification link to your inbox (${FirebaseRestAuthClient.AUTH_DOMAIN}). Open your Email App (Inbox or Spam), tap the link for Astryn AI, and then tap Verify below.",
+                    "Astryn AI sent a verification link to your email inbox. Open your Email App (Inbox or Spam), tap the link from Astryn AI, and then tap Verify below.",
                   style = MaterialTheme.typography.bodySmall,
                   color = glass.textSecondary,
                   textAlign = TextAlign.Center,
@@ -929,6 +786,7 @@ fun AuthScreen(
                           )
                       )
                       .clickable(enabled = !isCheckingVerification) {
+                        AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                         errorMessage = null
                         successBannerMessage = null
                         isCheckingVerification = true
@@ -947,6 +805,7 @@ fun AuthScreen(
                             .onSuccess { check ->
                               pendingVerificationIdToken = check.refreshedIdToken
                               if (check.isVerified) {
+                                AstrynSoundEngine.play(context, AstrynSoundEffect.SUCCESS)
                                 preferencesRepository.signInUser(
                                   uid = pendingVerificationUid,
                                   idToken = check.refreshedIdToken,
@@ -959,10 +818,12 @@ fun AuthScreen(
                                 pendingVerificationEmail = ""
                                 onAuthComplete()
                               } else {
+                                AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
                                 errorMessage = check.statusMessage
                               }
                             }
                             .onFailure { err ->
+                              AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
                               errorMessage =
                                 err.message ?: "Unable to check verification status."
                             }
@@ -1026,6 +887,7 @@ fun AuthScreen(
                         .clickable(
                           enabled = !isResendingVerification && resendCooldownSeconds == 0
                         ) {
+                          AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                           errorMessage = null
                           isResendingVerification = true
                           scope.launch {
@@ -1038,10 +900,12 @@ fun AuthScreen(
                             isResendingVerification = false
                             resendRes
                               .onSuccess { msg ->
+                                AstrynSoundEngine.play(context, AstrynSoundEffect.SUCCESS)
                                 resendCooldownSeconds = 30
                                 successBannerMessage = msg
                               }
                               .onFailure { err ->
+                                AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
                                 errorMessage =
                                   err.message ?: "Could not resend verification link."
                               }
@@ -1079,6 +943,7 @@ fun AuthScreen(
                         .background(glass.surfaceStandard)
                         .border(AppBorder.hairline, glass.borderSubtle, RoundedCornerShape(12.dp))
                         .clickable {
+                          AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                           pendingVerificationEmail = ""
                           errorMessage = null
                           successBannerMessage = null
@@ -1116,6 +981,7 @@ fun AuthScreen(
                         shape = RoundedCornerShape(12.dp),
                       )
                       .clickable {
+                        AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                         try {
                           val emailIntent =
                             Intent(Intent.ACTION_MAIN).apply {
@@ -1169,6 +1035,7 @@ fun AuthScreen(
                 title = "Sign In",
                 isSelected = !isSignUpMode,
                 onClick = {
+                  AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                   isSignUpMode = false
                   errorMessage = null
                   successBannerMessage = null
@@ -1179,6 +1046,7 @@ fun AuthScreen(
                 title = "Sign Up",
                 isSelected = isSignUpMode,
                 onClick = {
+                  AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                   isSignUpMode = true
                   errorMessage = null
                   successBannerMessage = null
@@ -1384,6 +1252,7 @@ fun AuthScreen(
                         modifier =
                           Modifier.clip(RoundedCornerShape(6.dp))
                             .clickable {
+                              AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                               resetEmailInput = email
                               resetConfirmationMessage = null
                               showForgotPasswordDialog = true
@@ -1431,7 +1300,10 @@ fun AuthScreen(
                         modifier =
                           Modifier.size(36.dp)
                             .clip(CircleShape)
-                            .clickable { passwordVisible = !passwordVisible }
+                            .clickable {
+                              AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+                              passwordVisible = !passwordVisible
+                            }
                             .testTag("auth_toggle_password_visibility"),
                         contentAlignment = Alignment.Center,
                       ) {
@@ -1527,7 +1399,10 @@ fun AuthScreen(
                           modifier =
                             Modifier.size(36.dp)
                               .clip(CircleShape)
-                              .clickable { confirmPasswordVisible = !confirmPasswordVisible },
+                              .clickable {
+                                AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+                                confirmPasswordVisible = !confirmPasswordVisible
+                              },
                           contentAlignment = Alignment.Center,
                         ) {
                           Icon(
@@ -1570,7 +1445,10 @@ fun AuthScreen(
                         color = Color.White.copy(alpha = 0.35f),
                         shape = RoundedCornerShape(14.dp),
                       )
-                      .clickable(enabled = canClickSubmit) { handlePrimarySubmit() }
+                      .clickable(enabled = canClickSubmit) {
+                        AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+                        handlePrimarySubmit()
+                      }
                       .padding(horizontal = AppSpacing.lg, vertical = 14.dp)
                       .testTag("auth_submit_button"),
                   contentAlignment = Alignment.Center,
@@ -1657,6 +1535,7 @@ fun AuthScreen(
                         shape = RoundedCornerShape(14.dp),
                       )
                       .clickable(enabled = !isSubmitting && lockoutSecondsRemaining == 0) {
+                        AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                         triggerGoogleSignInOrChooser()
                       }
                       .padding(horizontal = AppSpacing.md, vertical = 12.dp)
@@ -1761,6 +1640,7 @@ fun AuthScreen(
                     shape = RoundedCornerShape(12.dp),
                   )
                   .clickable {
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
                     executeVerifiedGoogleSignIn(
                       targetEmail = acctEmail,
                       targetName = googleNameDraft.ifBlank { acctName },
@@ -1970,11 +1850,16 @@ fun AuthScreen(
           text = "Send Reset Link",
           variant = GlassButtonVariant.PRIMARY,
           onClick = {
+            AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
             val target = resetEmailInput.trim()
             scope.launch {
               FirebaseRestAuthClient.sendPasswordResetEmail(target)
-                .onSuccess { msg -> resetConfirmationMessage = msg }
+                .onSuccess { msg ->
+                  AstrynSoundEngine.play(context, AstrynSoundEffect.SUCCESS)
+                  resetConfirmationMessage = msg
+                }
                 .onFailure { err ->
+                  AstrynSoundEngine.play(context, AstrynSoundEffect.ERROR)
                   resetConfirmationMessage =
                     err.message ?: "Please enter a valid email address."
                 }
@@ -2042,7 +1927,7 @@ fun AuthScreen(
           PrivacyRuleItem(
             title = "4. Encrypted Cloud Vault",
             description =
-              "Aapka account aur conversations Firebase Authentication & Cloud Firestore (${FirebaseRestAuthClient.PROJECT_ID}) mein सुरक्षित rehte hain.",
+              "Aapka account aur conversations Astryn AI Cloud authentication aur Firestore mein सुरक्षित rehte hain.",
           )
         }
       },

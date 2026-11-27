@@ -58,6 +58,7 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -72,6 +73,8 @@ import androidx.compose.runtime.collectAsState
 import com.example.data.repository.AiPersona
 import com.example.data.repository.ChatBackgroundStyle
 import com.example.data.repository.UserPreferencesRepository
+import com.example.ui.audio.AstrynSoundEffect
+import com.example.ui.audio.AstrynSoundEngine
 import com.example.ui.theme.AppBorder
 import com.example.ui.theme.AppMotion
 import com.example.ui.theme.AppOpacity
@@ -437,6 +440,7 @@ fun GlassCard(
   content: @Composable ColumnScope.() -> Unit,
 ) {
   val glass = AppThemeTokens.glass
+  val context = LocalContext.current
   val reducedMotion = AppThemeTokens.reducedMotion
   val interactionSource = remember { MutableInteractionSource() }
   val isPressed by interactionSource.collectIsPressedAsState()
@@ -467,7 +471,10 @@ fun GlassCard(
           indication = androidx.compose.material3.ripple(),
           enabled = enabled,
           role = Role.Button,
-          onClick = onClick,
+          onClick = {
+            AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+            onClick()
+          },
         )
     } else {
       Modifier
@@ -522,6 +529,7 @@ fun GlassButton(
   shape: Shape = AppRadius.shapeMd,
 ) {
   val glass = AppThemeTokens.glass
+  val context = LocalContext.current
   val reducedMotion = AppThemeTokens.reducedMotion
   val interactionSource = remember { MutableInteractionSource() }
   val isPressed by interactionSource.collectIsPressedAsState()
@@ -611,7 +619,10 @@ fun GlassButton(
           indication = androidx.compose.material3.ripple(),
           enabled = isInteractive,
           role = Role.Button,
-          onClick = onClick,
+          onClick = {
+            AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+            onClick()
+          },
         )
         .padding(horizontal = AppSpacing.md, vertical = AppSpacing.sm),
     contentAlignment = Alignment.Center,
@@ -661,6 +672,7 @@ fun GlassIconButton(
   subtle: Boolean = false,
 ) {
   val glass = AppThemeTokens.glass
+  val context = LocalContext.current
   val reducedMotion = AppThemeTokens.reducedMotion
   val interactionSource = remember { MutableInteractionSource() }
   val isPressed by interactionSource.collectIsPressedAsState()
@@ -720,7 +732,10 @@ fun GlassIconButton(
           indication = androidx.compose.material3.ripple(),
           enabled = enabled,
           role = Role.Button,
-          onClick = onClick,
+          onClick = {
+            AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+            onClick()
+          },
         )
         .semantics {
           this.contentDescription = contentDescription

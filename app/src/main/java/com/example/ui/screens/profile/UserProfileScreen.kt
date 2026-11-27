@@ -309,9 +309,6 @@ fun UserProfileScreen(
   var isBusy by remember { mutableStateOf(false) }
   var statusBannerMessage by remember { mutableStateOf<String?>(null) }
   var isStatusError by remember { mutableStateOf(false) }
-  var showFirebaseKeySetupBox by rememberSaveable { mutableStateOf(false) }
-  var firebaseConfigSnippetInput by rememberSaveable { mutableStateOf(preferences.firebaseWebApiKey) }
-  var pendingRetryVerifyEmail by remember { mutableStateOf(false) }
 
   var showDeleteAccountDialog by rememberSaveable { mutableStateOf(false) }
   var deleteConfirmInput by rememberSaveable { mutableStateOf("") }
@@ -420,7 +417,7 @@ fun UserProfileScreen(
                 color = glass.textPrimary,
               )
               Text(
-                text = "Firebase Vault (${FirebaseRestAuthClient.PROJECT_ID}) • UID Isolated",
+                text = "Astryn Cloud Vault • UID Isolated",
                 style = MaterialTheme.typography.labelSmall,
                 color = glass.accentCyan,
               )
@@ -480,131 +477,6 @@ fun UserProfileScreen(
                 fontWeight = FontWeight.SemiBold,
                 color = glass.textPrimary,
                 modifier = Modifier.weight(1f),
-              )
-            }
-          }
-        }
-
-        // Inline Firebase Web API Key Setup Box (Auto-shown if FIREBASE_KEY_MISSING occurs)
-        AnimatedVisibility(
-          visible = showFirebaseKeySetupBox,
-          enter = fadeIn() + expandVertically(),
-          exit = fadeOut() + shrinkVertically(),
-        ) {
-          GlassSurface(
-            elevated = false,
-            modifier =
-              Modifier.fillMaxWidth()
-                .padding(horizontal = AppSpacing.screenHorizontal, vertical = 6.dp)
-                .testTag("profile_firebase_key_card"),
-          ) {
-            Column(
-              modifier = Modifier.fillMaxWidth(),
-              verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-              Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-              ) {
-                Row(
-                  verticalAlignment = Alignment.CenterVertically,
-                  horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                  Icon(
-                    imageVector = Icons.Outlined.Key,
-                    contentDescription = null,
-                    tint = glass.accentCyan,
-                    modifier = Modifier.size(16.dp),
-                  )
-                  Text(
-                    text = "Firebase Web API Key (${FirebaseRestAuthClient.PROJECT_ID})",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = glass.textPrimary,
-                  )
-                }
-                Text(
-                  text = "Hide",
-                  style = MaterialTheme.typography.labelSmall,
-                  color = glass.textSecondary,
-                  modifier =
-                    Modifier.clickable { showFirebaseKeySetupBox = false }
-                      .padding(horizontal = 6.dp, vertical = 4.dp),
-                )
-              }
-
-              Text(
-                text =
-                  "Firebase Console → Project Settings → General → Web API Key ('AIzaSy...') yahan paste karein taaki Email Verification link bheja ja sake:",
-                style = MaterialTheme.typography.bodySmall,
-                color = glass.textSecondary,
-              )
-
-              GlassTextField(
-                value = firebaseConfigSnippetInput,
-                onValueChange = { firebaseConfigSnippetInput = it },
-                placeholder = "Paste AIzaSy... Web API Key or firebaseConfig",
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth().testTag("profile_firebase_apikey_input"),
-              )
-
-              GlassButton(
-                text =
-                  if (pendingRetryVerifyEmail) "Save Firebase Key & Send Verification Link"
-                  else "Save Firebase Key",
-                variant = GlassButtonVariant.PRIMARY,
-                enabled = !isBusy,
-                onClick = {
-                  val extracted =
-                    FirebaseRestAuthClient.extractApiKeyFromSnippet(firebaseConfigSnippetInput)
-                  if (extracted == null) {
-                    isStatusError = true
-                    statusBannerMessage =
-                      "Valid Firebase Web API Key ('AIzaSy...') nahi mila. Kripya Firebase Project Settings → General se Web API Key paste karein."
-                  } else {
-                    preferencesRepository.updateFirebaseWebApiKey(extracted)
-                    showFirebaseKeySetupBox = false
-                    if (pendingRetryVerifyEmail && preferences.userEmail.isNotBlank()) {
-                      pendingRetryVerifyEmail = false
-                      scope.launch {
-                        isBusy = true
-                        val retryRes =
-                          FirebaseRestAuthClient.sendVerificationEmailToUser(
-                            idToken = preferences.authIdToken,
-                            email = preferences.userEmail,
-                            uid = preferences.userUid,
-                          )
-                        isBusy = false
-                        retryRes
-                          .onSuccess { msg ->
-                            isStatusError = false
-                            statusBannerMessage = msg
-                          }
-                          .onFailure { err ->
-                            val raw = err.message ?: "Could not send verification link."
-                            if (
-                              raw.contains("FIREBASE_KEY_MISSING", ignoreCase = true) ||
-                                raw.contains("API key not valid", ignoreCase = true)
-                            ) {
-                              showFirebaseKeySetupBox = true
-                            }
-                            isStatusError = true
-                            statusBannerMessage =
-                              raw
-                                .removePrefix("FIREBASE_KEY_MISSING:")
-                                .removePrefix("SESSION_TOKEN_MISSING:")
-                                .trim()
-                          }
-                      }
-                    } else {
-                      isStatusError = false
-                      statusBannerMessage =
-                        "Firebase Web API Key saved (${FirebaseRestAuthClient.PROJECT_ID}) ✓"
-                    }
-                  }
-                },
-                modifier = Modifier.fillMaxWidth().testTag("profile_save_firebase_key_button"),
               )
             }
           }
@@ -1102,13 +974,6 @@ fun UserProfileScreen(
                           }
                           .onFailure { err ->
                             val raw = err.message ?: "Could not update Email ID."
-                            if (
-                              raw.contains("FIREBASE_KEY_MISSING", ignoreCase = true) ||
-                                raw.contains("API key not valid", ignoreCase = true) ||
-                                raw.contains("FIREBASE_WEB_API_KEY", ignoreCase = true)
-                            ) {
-                              showFirebaseKeySetupBox = true
-                            }
                             isStatusError = true
                             statusBannerMessage =
                               raw
@@ -1139,20 +1004,10 @@ fun UserProfileScreen(
                         res
                           .onSuccess { msg ->
                             isStatusError = false
-                            showFirebaseKeySetupBox = false
-                            pendingRetryVerifyEmail = false
                             statusBannerMessage = msg
                           }
                           .onFailure { err ->
                             val raw = err.message ?: "Could not send verification link."
-                            if (
-                              raw.contains("FIREBASE_KEY_MISSING", ignoreCase = true) ||
-                                raw.contains("API key not valid", ignoreCase = true) ||
-                                raw.contains("FIREBASE_WEB_API_KEY", ignoreCase = true)
-                            ) {
-                              showFirebaseKeySetupBox = true
-                              pendingRetryVerifyEmail = true
-                            }
                             isStatusError = true
                             statusBannerMessage =
                               raw
@@ -1327,13 +1182,6 @@ fun UserProfileScreen(
                           }
                           .onFailure { err ->
                             val raw = err.message ?: "Failed to change password."
-                            if (
-                              raw.contains("FIREBASE_KEY_MISSING", ignoreCase = true) ||
-                                raw.contains("API key not valid", ignoreCase = true) ||
-                                raw.contains("FIREBASE_WEB_API_KEY", ignoreCase = true)
-                            ) {
-                              showFirebaseKeySetupBox = true
-                            }
                             isStatusError = true
                             statusBannerMessage =
                               raw
@@ -1363,13 +1211,6 @@ fun UserProfileScreen(
                           }
                           .onFailure { err ->
                             val raw = err.message ?: "Failed to send reset email."
-                            if (
-                              raw.contains("FIREBASE_KEY_MISSING", ignoreCase = true) ||
-                                raw.contains("API key not valid", ignoreCase = true) ||
-                                raw.contains("FIREBASE_WEB_API_KEY", ignoreCase = true)
-                            ) {
-                              showFirebaseKeySetupBox = true
-                            }
                             isStatusError = true
                             statusBannerMessage =
                               raw
@@ -1592,7 +1433,7 @@ fun UserProfileScreen(
           verticalArrangement = Arrangement.spacedBy(AppSpacing.sm),
         ) {
           Text(
-            text = "This will permanently delete your account (${preferences.userEmail}), profile, and all isolated chat history from Firebase (${FirebaseRestAuthClient.PROJECT_ID}), Cloud Firestore, and this device.",
+            text = "This will permanently delete your account (${preferences.userEmail}), profile, and all isolated chat history from Astryn AI Cloud and this device.",
             style = MaterialTheme.typography.bodySmall,
             color = glass.textSecondary,
           )

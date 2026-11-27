@@ -108,21 +108,7 @@ object FirebaseRestAuthClient {
    * 4. `UserApiKeyManager` (if the user saved their Google Cloud / Firebase key in API settings)
    */
   fun resolveConfiguredApiKey(): String? {
-    // 1. Check user-saved Firebase Web API Key in UserPreferencesRepository
-    val userSaved =
-      try {
-        com.example.data.repository.UserPreferencesRepository
-          .getInstance()
-          .preferencesFlow
-          .value
-          .firebaseWebApiKey
-          .trim()
-      } catch (_: Exception) {
-        ""
-      }
-    extractApiKeyFromSnippet(userSaved)?.let { return it }
-
-    // 2. Check BuildConfig.FIREBASE_WEB_API_KEY
+    // 1. Prioritize BuildConfig.FIREBASE_WEB_API_KEY (injected via AI Studio Secrets panel / .env)
     val rawBuildConfig =
       try {
         BuildConfig.FIREBASE_WEB_API_KEY.trim()
@@ -137,6 +123,20 @@ object FirebaseRestAuthClient {
       extractApiKeyFromSnippet(rawBuildConfig)?.let { return it }
       return rawBuildConfig
     }
+
+    // 2. Fallback to stored Firebase Web API Key in UserPreferencesRepository
+    val userSaved =
+      try {
+        com.example.data.repository.UserPreferencesRepository
+          .getInstance()
+          .preferencesFlow
+          .value
+          .firebaseWebApiKey
+          .trim()
+      } catch (_: Exception) {
+        ""
+      }
+    extractApiKeyFromSnippet(userSaved)?.let { return it }
 
     // 3. Check cached auto-discovered key from Firebase Hosting init.json
     cachedAutoDiscoveredApiKey?.takeIf { it.isNotBlank() }?.let { return it }
@@ -347,7 +347,7 @@ object FirebaseRestAuthClient {
       if (apiKey == null) {
         return@withContext Result.failure(
           IllegalStateException(
-            "FIREBASE_KEY_MISSING: Firebase ($PROJECT_ID) mein account create karne aur verification link bhejne ke liye apna Firebase Web API Key (AIzaSy...) niche paste karein."
+            "FIREBASE_KEY_MISSING: Authentication service is not configured yet. Please configure FIREBASE_WEB_API_KEY in AI Studio Secrets."
           )
         )
       }
@@ -446,10 +446,10 @@ object FirebaseRestAuthClient {
               fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
               statusMessage =
                 if (emailSentOk) {
-                  "Account created in Firebase ($PROJECT_ID) & verification link sent to $cleanEmail!"
+                  "Astryn AI account created & verification link sent to $cleanEmail!"
                 } else {
                   emailSentResult.exceptionOrNull()?.message
-                    ?: "Account created in Firebase ($PROJECT_ID). Tap 'Resend Link' to send verification email."
+                    ?: "Astryn AI account created. Tap 'Resend Link' to send verification email."
                 },
             )
           )
@@ -457,7 +457,7 @@ object FirebaseRestAuthClient {
       } catch (e: Exception) {
         Result.failure(
           IllegalStateException(
-            "Unable to reach Firebase ($PROJECT_ID): ${e.localizedMessage ?: "Network error"}"
+            "Unable to reach Astryn AI authentication: ${e.localizedMessage ?: "Network error"}"
           )
         )
       }
@@ -575,9 +575,9 @@ object FirebaseRestAuthClient {
               fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
               statusMessage =
                 if (isAlreadyVerified) {
-                  "Existing account verified & signed in ($PROJECT_ID) ✓"
+                  "Astryn AI account verified & signed in ✓"
                 } else {
-                  "Verification link sent to $cleanEmail via Firebase ($PROJECT_ID)! Click the link in your email to enter."
+                  "Astryn AI verification link sent to $cleanEmail! Click the link in your email to enter."
                 },
             )
           }
@@ -609,7 +609,7 @@ object FirebaseRestAuthClient {
       if (apiKey == null) {
         return@withContext Result.failure(
           IllegalStateException(
-            "FIREBASE_KEY_MISSING: Firebase ($PROJECT_ID) mein sign in karne ke liye apna Firebase Web API Key (AIzaSy...) niche paste karein."
+            "FIREBASE_KEY_MISSING: Authentication service is not configured yet. Please configure FIREBASE_WEB_API_KEY in AI Studio Secrets."
           )
         )
       }
@@ -742,9 +742,9 @@ object FirebaseRestAuthClient {
               fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
               statusMessage =
                 if (isVerifiedInFirebase) {
-                  "Authenticated & private chat vault loaded ($PROJECT_ID) ✓"
+                  "Astryn AI authenticated & private chat vault loaded ✓"
                 } else {
-                  "Email verification pending! Verification link sent to $cleanEmail — click the link in your inbox to enter."
+                  "Email verification pending! Astryn AI verification link sent to $cleanEmail — click the link in your inbox to enter."
                 },
             )
           )
@@ -752,7 +752,7 @@ object FirebaseRestAuthClient {
       } catch (e: Exception) {
         Result.failure(
           IllegalStateException(
-            "Unable to reach Firebase ($PROJECT_ID): ${e.localizedMessage ?: "Network error"}"
+            "Unable to reach Astryn AI authentication: ${e.localizedMessage ?: "Network error"}"
           )
         )
       }
@@ -869,7 +869,7 @@ object FirebaseRestAuthClient {
                     isFirestoreSynced = firestoreSynced,
                     refreshToken = refreshToken,
                     fallbackAliasUid = computeFallbackAlias(localId, resolvedEmail),
-                    statusMessage = "Signed in with Google OAuth & synced to Firestore ($PROJECT_ID) ✓",
+                    statusMessage = "Signed in with Google & synced to Astryn AI Cloud ✓",
                   )
                 )
               }
@@ -918,7 +918,7 @@ object FirebaseRestAuthClient {
                 isFirestoreSynced = firestoreSynced,
                 refreshToken = nextRefreshToken,
                 fallbackAliasUid = computeFallbackAlias(refreshedUid, cleanEmail),
-                statusMessage = "Signed in with Google & loaded private Firestore vault ($PROJECT_ID) ✓",
+                statusMessage = "Signed in with Google & loaded private Astryn AI vault ✓",
               )
             )
           }
@@ -978,7 +978,7 @@ object FirebaseRestAuthClient {
                   isFirestoreSynced = firestoreSynced,
                   refreshToken = refreshToken,
                   fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
-                  statusMessage = "Signed in with Google & loaded private Firestore vault ($PROJECT_ID) ✓",
+                  statusMessage = "Signed in with Google & loaded private Astryn AI vault ✓",
                 )
               )
             }
@@ -1039,7 +1039,7 @@ object FirebaseRestAuthClient {
                   isFirestoreSynced = firestoreSynced,
                   refreshToken = refreshToken,
                   fallbackAliasUid = computeFallbackAlias(localId, cleanEmail),
-                  statusMessage = "Google Account registered in Firebase Auth & Firestore ($PROJECT_ID) ✓",
+                  statusMessage = "Google Account registered with Astryn AI Cloud ✓",
                 )
               )
             }
@@ -1084,7 +1084,7 @@ object FirebaseRestAuthClient {
           isFirestoreSynced = firestoreSynced,
           refreshToken = storedRefreshToken,
           fallbackAliasUid = computeFallbackAlias(uid, cleanEmail),
-          statusMessage = "Signed in with Google as $effectiveName ($PROJECT_ID) ✓",
+          statusMessage = "Signed in with Google as $effectiveName (Astryn AI) ✓",
         )
       )
     }
@@ -1104,7 +1104,7 @@ object FirebaseRestAuthClient {
       if (apiKey == null) {
         return@withContext Result.failure(
           IllegalStateException(
-            "FIREBASE_KEY_MISSING: Password reset link bhejne ke liye Firebase Web API Key (AIzaSy...) required hai."
+            "FIREBASE_KEY_MISSING: Password reset service is not configured yet. Please configure FIREBASE_WEB_API_KEY in AI Studio Secrets."
           )
         )
       }
@@ -1127,7 +1127,7 @@ object FirebaseRestAuthClient {
             val friendlyError = parseFirebaseAuthError(bodyStr, isSignUp = false)
             return@withContext Result.failure(IllegalStateException(friendlyError))
           }
-          Result.success("Firebase password reset link sent to $cleanEmail ✓")
+          Result.success("Astryn AI password reset link sent to $cleanEmail ✓")
         }
       } catch (e: Exception) {
         Result.failure(
@@ -1567,7 +1567,7 @@ object FirebaseRestAuthClient {
       if (apiKey == null) {
         return@withContext Result.failure(
           IllegalStateException(
-            "FIREBASE_KEY_MISSING: Email verification check karne ke liye apna Firebase Web API Key (AIzaSy...) paste karein."
+            "FIREBASE_KEY_MISSING: Email verification service is not configured yet. Please configure FIREBASE_WEB_API_KEY in AI Studio Secrets."
           )
         )
       }
@@ -1636,7 +1636,7 @@ object FirebaseRestAuthClient {
               isVerified = true,
               refreshedIdToken = activeToken,
               refreshToken = capturedRefreshToken,
-              statusMessage = "Email $cleanEmail verified in Firebase ($PROJECT_ID) ✓ Welcome!",
+              statusMessage = "Email $cleanEmail verified with Astryn AI ✓ Welcome!",
             )
           )
         } else {
@@ -1706,7 +1706,7 @@ object FirebaseRestAuthClient {
         phone = phone,
       )
       Result.success(
-        if (fsSynced) "Profile updated & synced to Cloud Firestore ($PROJECT_ID) ✓"
+        if (fsSynced) "Profile updated & synced to Astryn AI Cloud ✓"
         else "Profile updated & saved to your private account vault ✓"
       )
     }
@@ -1734,7 +1734,7 @@ object FirebaseRestAuthClient {
       if (apiKey == null) {
         return@withContext Result.failure(
           IllegalStateException(
-            "FIREBASE_KEY_MISSING: Email update karne ke liye apna Firebase Web API Key (AIzaSy...) paste karein."
+            "FIREBASE_KEY_MISSING: Account email update service is not configured yet. Please configure FIREBASE_WEB_API_KEY in AI Studio Secrets."
           )
         )
       }
@@ -1807,7 +1807,7 @@ object FirebaseRestAuthClient {
       } catch (e: Exception) {
         return@withContext Result.failure(
           IllegalStateException(
-            "Unable to update Email ID in Firebase ($PROJECT_ID): ${e.localizedMessage ?: "Network error"}"
+            "Unable to update Email ID in Astryn AI: ${e.localizedMessage ?: "Network error"}"
           )
         )
       }
@@ -1855,7 +1855,7 @@ object FirebaseRestAuthClient {
       if (apiKey == null) {
         return@withContext Result.failure(
           IllegalStateException(
-            "FIREBASE_KEY_MISSING: Password change karne ke liye apna Firebase Web API Key (AIzaSy...) paste karein."
+            "FIREBASE_KEY_MISSING: Password update service is not configured yet. Please configure FIREBASE_WEB_API_KEY in AI Studio Secrets."
           )
         )
       }
@@ -1928,20 +1928,20 @@ object FirebaseRestAuthClient {
       } catch (e: Exception) {
         return@withContext Result.failure(
           IllegalStateException(
-            "Unable to update password in Firebase ($PROJECT_ID): ${e.localizedMessage ?: "Network error"}"
+            "Unable to update password in Astryn AI: ${e.localizedMessage ?: "Network error"}"
           )
         )
       }
 
       Result.success(
-        "Password updated & encrypted in Firebase Auth ($PROJECT_ID) ✓" to refreshedToken
+        "Password updated & encrypted in Astryn AI ✓" to refreshedToken
       )
     }
 
   private fun mapAccountUpdateFailureMessage(rawBody: String, isEmailChange: Boolean): String {
     return when {
       rawBody.contains("EMAIL_EXISTS", ignoreCase = true) ->
-        "This Email ID is already linked to another account in Firebase ($PROJECT_ID)."
+        "This Email ID is already linked to another Astryn AI account."
       rawBody.contains("CREDENTIAL_TOO_OLD_LOGIN_AGAIN", ignoreCase = true) ||
         rawBody.contains("REQUIRES_RECENT_LOGIN", ignoreCase = true) ->
         if (isEmailChange) {
@@ -2057,7 +2057,7 @@ object FirebaseRestAuthClient {
       if (apiKey == null) {
         return@withContext Result.failure(
           IllegalStateException(
-            "FIREBASE_KEY_MISSING: Verification link bhejne ke liye Firebase Web API Key (AIzaSy...) required hai."
+            "FIREBASE_KEY_MISSING: Email verification service is not configured yet. Please configure FIREBASE_WEB_API_KEY in AI Studio Secrets."
           )
         )
       }
@@ -2162,7 +2162,7 @@ object FirebaseRestAuthClient {
         } catch (_: Exception) {}
       }
 
-      Result.success("Account permanently deleted from Firebase & Firestore ($PROJECT_ID).")
+      Result.success("Account permanently deleted from Astryn AI Cloud.")
     }
 
   private fun updateProfileDisplayName(apiKey: String, idToken: String, displayName: String) {
@@ -2332,13 +2332,13 @@ object FirebaseRestAuthClient {
 
     return when {
       rawMessage.contains("EMAIL_EXISTS", ignoreCase = true) ->
-        "This email is already registered in Firebase ($PROJECT_ID). Switch to 'Sign In' instead."
+        "This email is already registered with Astryn AI. Switch to 'Sign In' instead."
       rawMessage.contains("EMAIL_NOT_FOUND", ignoreCase = true) ||
         rawMessage.contains("INVALID_LOGIN_CREDENTIALS", ignoreCase = true) ||
         rawMessage.contains("INVALID_PASSWORD", ignoreCase = true) ->
-        "Invalid email or password for Firebase project $PROJECT_ID. Please check your credentials or Create Account first."
+        "Invalid email or password for Astryn AI. Please check your credentials or Create Account first."
       rawMessage.contains("USER_DISABLED", ignoreCase = true) ->
-        "This user account has been disabled in Firebase ($PROJECT_ID)."
+        "This user account has been disabled in Astryn AI."
       rawMessage.contains("TOO_MANY_ATTEMPTS_TRY_LATER", ignoreCase = true) ->
         "Security Lockout: Too many failed attempts. Please wait a moment and try again."
       rawMessage.contains("OPERATION_NOT_ALLOWED", ignoreCase = true) ||
@@ -2347,10 +2347,10 @@ object FirebaseRestAuthClient {
       rawMessage.contains("API key not valid", ignoreCase = true) ->
         "FIREBASE_WEB_API_KEY in the AI Studio Secrets panel is invalid. Please paste the apiKey from your firebaseConfig."
       rawMessage.isNotBlank() ->
-        "Firebase ($PROJECT_ID): $rawMessage"
+        "Astryn AI Auth: $rawMessage"
       else ->
-        if (isSignUp) "Could not create account in Firebase ($PROJECT_ID)."
-        else "Could not sign in to Firebase ($PROJECT_ID)."
+        if (isSignUp) "Could not create Astryn AI account."
+        else "Could not sign in to Astryn AI."
     }
   }
 }

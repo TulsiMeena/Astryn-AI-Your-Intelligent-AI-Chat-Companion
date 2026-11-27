@@ -29,6 +29,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.HelpOutline
+import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.CheckCircle
@@ -69,6 +70,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -93,6 +95,8 @@ import com.example.data.repository.ResponseLanguage
 import com.example.data.repository.ResponseStyle
 import com.example.data.repository.UserPreferences
 import com.example.data.repository.UserPreferencesRepository
+import com.example.ui.audio.AstrynSoundEffect
+import com.example.ui.audio.AstrynSoundEngine
 import com.example.ui.components.AmbientGlassBackground
 import com.example.ui.components.AstrynBrandShowcase
 import com.example.ui.components.GlassButton
@@ -130,6 +134,7 @@ fun SettingsScreen(
   geminiService: GeminiService = remember { GeminiService() },
 ) {
   val glass = AppThemeTokens.glass
+  val context = LocalContext.current
   val preferences by preferencesRepository.preferencesFlow.collectAsState()
   val storageError by preferencesRepository.storageErrorFlow.collectAsState()
   val apiKeyState by apiKeyManager.configStateFlow.collectAsState()
@@ -476,8 +481,34 @@ fun SettingsScreen(
                 subtitle = "Automatically shift background aura for Romantic, Fun/Roast, Coding & AI Live Voice",
                 icon = Icons.Outlined.AutoAwesome,
                 checked = preferences.moodReactiveBg,
-                onCheckedChange = { preferencesRepository.setMoodReactiveBg(it) },
+                onCheckedChange = { enabled ->
+                  preferencesRepository.setMoodReactiveBg(enabled)
+                  AstrynSoundEngine.play(
+                    context,
+                    if (enabled) AstrynSoundEffect.TOGGLE_ON else AstrynSoundEffect.TOGGLE_OFF,
+                  )
+                },
                 testTag = "settings_toggle_mood_reactive_bg",
+              )
+
+              GlassDivider()
+
+              // Tactile UI Sound Effects Toggle
+              SettingsToggleRow(
+                title = "Tactile UI Sound Effects",
+                subtitle = "Play crisp futuristic audio feedback for buttons, toggles, messages & voice mode",
+                icon = Icons.AutoMirrored.Outlined.VolumeUp,
+                checked = preferences.uiSoundsEnabled,
+                onCheckedChange = { enabled ->
+                  if (!enabled) {
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.TOGGLE_OFF)
+                  }
+                  preferencesRepository.setUiSoundsEnabled(enabled)
+                  if (enabled) {
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.TOGGLE_ON)
+                  }
+                },
+                testTag = "settings_toggle_ui_sounds",
               )
 
               GlassDivider()
@@ -488,7 +519,13 @@ fun SettingsScreen(
                 subtitle = stringResource(R.string.settings_reduced_motion_sub),
                 icon = Icons.Outlined.MotionPhotosOff,
                 checked = preferences.reducedMotion,
-                onCheckedChange = { preferencesRepository.setReducedMotion(it) },
+                onCheckedChange = { enabled ->
+                  preferencesRepository.setReducedMotion(enabled)
+                  AstrynSoundEngine.play(
+                    context,
+                    if (enabled) AstrynSoundEffect.TOGGLE_ON else AstrynSoundEffect.TOGGLE_OFF,
+                  )
+                },
                 testTag = "settings_toggle_reduced_motion",
               )
 
@@ -500,7 +537,13 @@ fun SettingsScreen(
                 subtitle = stringResource(R.string.settings_reduce_transparency_sub),
                 icon = Icons.Outlined.Contrast,
                 checked = preferences.reduceTransparency,
-                onCheckedChange = { preferencesRepository.setReduceTransparency(it) },
+                onCheckedChange = { enabled ->
+                  preferencesRepository.setReduceTransparency(enabled)
+                  AstrynSoundEngine.play(
+                    context,
+                    if (enabled) AstrynSoundEffect.TOGGLE_ON else AstrynSoundEffect.TOGGLE_OFF,
+                  )
+                },
                 testTag = "settings_toggle_reduce_transparency",
               )
             }
@@ -577,7 +620,13 @@ fun SettingsScreen(
                 subtitle = "Fetch live facts and clickable source citations via Google Search when needed",
                 icon = Icons.Outlined.Public,
                 checked = preferences.webSearchEnabled,
-                onCheckedChange = { preferencesRepository.setWebSearchEnabled(it) },
+                onCheckedChange = { enabled ->
+                  preferencesRepository.setWebSearchEnabled(enabled)
+                  AstrynSoundEngine.play(
+                    context,
+                    if (enabled) AstrynSoundEffect.TOGGLE_ON else AstrynSoundEffect.TOGGLE_OFF,
+                  )
+                },
                 testTag = "settings_toggle_web_search",
               )
 

@@ -70,6 +70,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -85,6 +86,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.example.R
+import com.example.ui.audio.AstrynSoundEffect
+import com.example.ui.audio.AstrynSoundEngine
 import com.example.ui.navigation.RecentConversationItem
 import com.example.ui.theme.AppBorder
 import com.example.ui.theme.AppRadius
@@ -126,6 +129,7 @@ fun GlassSidebarContent(
   onClearSidebarFeedback: () -> Unit = {},
   onNavigateAuth: () -> Unit = {},
 ) {
+  val context = LocalContext.current
   val glass = AppThemeTokens.glass
   val preferences by UserPreferencesRepository.getInstance().preferencesFlow.collectAsState()
   var searchQuery by rememberSaveable { mutableStateOf("") }
@@ -266,7 +270,10 @@ fun GlassSidebarContent(
                         role = Role.Button
                         contentDescription = "Clear search query"
                       }
-                      .clickable { searchQuery = "" }
+                      .clickable {
+                        AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+                        searchQuery = ""
+                      }
                       .testTag("sidebar_search_clear"),
                   contentAlignment = Alignment.Center,
                 ) {
@@ -323,7 +330,10 @@ fun GlassSidebarContent(
                     selected = isCatSelected
                     contentDescription = "Filter by $catLabel"
                   }
-                  .clickable { selectedCategory = catKey }
+                  .clickable {
+                    AstrynSoundEngine.play(context, AstrynSoundEffect.TAP)
+                    selectedCategory = catKey
+                  }
                   .padding(horizontal = 10.dp, vertical = 5.dp)
                   .testTag("sidebar_category_$catKey"),
               contentAlignment = Alignment.Center,
